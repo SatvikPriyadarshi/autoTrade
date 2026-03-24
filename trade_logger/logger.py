@@ -251,33 +251,6 @@ class TradeLogger:
     # ──────────────────────────────────────────
     #  PERFORMANCE RETRIEVAL
     # ──────────────────────────────────────────
-    def get_recent_performance(self, symbol: str, last_n: int = 10) -> dict:
-        """
-        Get the bot's recent performance on a specific symbol.
-        Used to provide feedback context to Claude.
-        """
-        if not os.path.exists(self.trades_file):
-            return {"total": 0, "wins": 0, "losses": 0, "win_rate": 0}
-
-        trades = []
-        with open(self.trades_file, "r", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if row.get("symbol") == symbol and row.get("status") in ("WIN", "LOSS"):
-                    trades.append(row)
-
-        recent = trades[-last_n:] if trades else []
-        wins   = sum(1 for t in recent if t.get("status") == "WIN")
-        losses = sum(1 for t in recent if t.get("status") == "LOSS")
-        total  = len(recent)
-
-        return {
-            "total":    total,
-            "wins":     wins,
-            "losses":   losses,
-            "win_rate": (wins / total * 100) if total > 0 else 0,
-        }
-
     def print_summary(self):
         if not os.path.exists(self.trades_file):
             log.info("No trades logged yet.")

@@ -400,9 +400,6 @@ def main():
                     continue
                 symbol_last_analyzed_m5[symbol] = current_m5_time
 
-                # ── Get recent performance for AI context ──
-                perf = trade_log.get_recent_performance(symbol)
-
                 # ── PURE ALGORITHMIC ENGINE ──
                 decision = run_algorithmic_decision(
                     symbol=symbol,
