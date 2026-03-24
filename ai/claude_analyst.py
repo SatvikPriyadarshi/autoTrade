@@ -149,7 +149,7 @@ def validate_sl_tp_with_atr(
 def _build_prompt(
     symbol: str,
     current_price: float,
-    df_m15_recent: str,
+    df_m5_recent: str,
     df_h1_recent: str,
     smc_data: dict,
     patterns: list,
@@ -210,13 +210,13 @@ def _build_prompt(
 Analyze {symbol} and decide whether to take a trade.
 
 CURRENT PRICE: {current_price:.{d}f}
-TIMEFRAME: 15-minute (entry) with H1 structure and H4 trend context
+TIMEFRAME: M15 (POIs/Liquidity) + M5 (Execution/Candles) + H1/H4 (Trend)
 
 === H4 TREND DIRECTION ===
 {htf_trend.get('description', 'Unknown')}
 Trend: {htf_trend.get('direction', 'NEUTRAL')} ({htf_trend.get('strength', 'UNKNOWN')})
 
-=== H1 MARKET STRUCTURE ===
+=== M15/H1 MARKET STRUCTURE ===
 {bos}
 
 === ORDER BLOCKS (H1 — nearest active) ===
@@ -228,10 +228,10 @@ Trend: {htf_trend.get('direction', 'NEUTRAL')} ({htf_trend.get('strength', 'UNKN
 === SUPPORT & RESISTANCE LEVELS ===
 {sr_text}
 
-=== LIQUIDITY ANALYSIS ===
+=== LIQUIDITY ANALYSIS (M15) ===
 {liquidity_text}
 
-=== CHART PATTERNS DETECTED (M15) ===
+=== CHART PATTERNS (M15) ===
 {pat_text}
 
 === VOLUME ANALYSIS ===
@@ -239,12 +239,12 @@ Current volume: {vol_ratio}x average ({vol_vs_avg} avg, {vol_trend})
 
 === ATR ANALYSIS ===
 M15 ATR(14): {atr_m15:.{d}f}
-H1  ATR(14): {atr_h1:.{d}f}
+H1 ATR(14): {atr_h1:.{d}f}
 Suggested SL range: {atr_m15 * 1.0:.{d}f} to {atr_m15 * 2.0:.{d}f}
 Suggested TP range: {atr_m15 * 2.0:.{d}f} to {atr_m15 * 4.0:.{d}f}
 
-=== RECENT 15M CANDLES (last 20) ===
-{df_m15_recent}
+=== RECENT 5M CANDLES (last 20) ===
+{df_m5_recent}
 
 === RECENT H1 CANDLES (last 10) ===
 {df_h1_recent}
@@ -293,7 +293,7 @@ CRITICAL FORMATTING RULES FOR "reason":
 def analyse_with_claude(
     symbol: str,
     current_price: float,
-    df_m15: "pd.DataFrame",
+    df_m5: "pd.DataFrame",
     df_h1: "pd.DataFrame",
     smc_data: dict,
     patterns: list,
@@ -301,7 +301,7 @@ def analyse_with_claude(
     liquidity_text: str,
     htf_trend: dict,
     volume_info: dict,
-    atr_m15: float,
+    atr_m5: float,
     atr_h1: float,
     recent_performance: dict | None = None,
 ) -> dict:
@@ -311,13 +311,13 @@ def analyse_with_claude(
     """
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    m15_recent = df_m15.tail(20).to_string(index=False)
-    h1_recent  = df_h1.tail(10).to_string(index=False)
+    m5_recent = df_m5.tail(20).to_string(index=False)
+    h1_recent = df_h1.tail(10).to_string(index=False)
 
     prompt = _build_prompt(
         symbol=symbol,
         current_price=current_price,
-        df_m15_recent=m15_recent,
+        df_m5_recent=m5_recent,
         df_h1_recent=h1_recent,
         smc_data=smc_data,
         patterns=patterns,

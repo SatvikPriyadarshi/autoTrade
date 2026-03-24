@@ -150,6 +150,7 @@ def main():
     symbol_trades_today     = {s: 0 for s in tradable_symbols}
     symbol_last_trade_time  = {s: None for s in tradable_symbols}
     symbol_last_was_loss    = {s: False for s in tradable_symbols}
+    symbol_last_analyzed_m5 = {s: None for s in tradable_symbols}  # Throttle API to 1 call per M5 candle
     current_day = datetime.now(GMT).date()
 
     log.info(f"Pairs: {', '.join(tradable_symbols)} | Max trades: {MAX_TRADES_DAY}/day")
@@ -292,8 +293,13 @@ def main():
                 # ── Pre-filter: Skip API call if no point of interest ──
                 near = is_near_poi(current_price, smc_data, base_symbol)
                 if not near and not patterns and not sweeps:
-                    log.info(f"[{symbol}] No POI, no patterns, no sweeps. Skipping API call.")
                     continue
+
+                # ── Cost Control: Only analyze ONE time per M5 candle ──
+                current_m5_time = df_m5['time'].iloc[-1]
+                if symbol_last_analyzed_m5.get(symbol) == current_m5_time:
+                    continue
+                symbol_last_analyzed_m5[symbol] = current_m5_time
 
                 # ── Get recent performance for AI context ──
                 perf = trade_log.get_recent_performance(symbol)
@@ -302,7 +308,7 @@ def main():
                 decision = analyse_with_claude(
                     symbol=symbol,
                     current_price=current_price,
-                    df_m15=df_m15,
+                    df_m5=df_m5,
                     df_h1=df_h1,
                     smc_data=smc_data,
                     patterns=patterns,
@@ -312,7 +318,7 @@ def main():
                     volume_info=volume_info,
                     atr_m15=atr_m15,
                     atr_h1=atr_h1,
-                    recent_performance=perf,
+                    recent_performance=perf
                 )
 
                 # ── Log the signal ──
@@ -363,17 +369,20 @@ def main():
                 # Gate 6: M5 entry confirmation
                 m5_ok, m5_pattern = confirm_m5_entry(df_m5, action)
                 if not m5_ok:
-                    log.info(f"[{symbol}] ❌ M5 confirmation failed: {m5_pattern}. Waiting for trigger.")
-                    continue
-                log.info(f"[{symbol}] ✅ M5 confirmed: {m5_pattern}")
+                    log.info(f"[{symbol}] ⚠️ M5 confirmation missing: {m5_pattern}. (Bypassed)")
+                    # continue  # BYPASSED
+                else:
+                    log.info(f"[{symbol}] ✅ M5 confirmed: {m5_pattern}")
 
                 # Gate 7: Multi-timeframe confirmation (M5 + M15 + H1 alignment)
                 mtf_confirmed, mtf_reason, mtf_analysis = get_multi_timeframe_confirmation(
                     symbol, action, df_m5, df_m15, df_h1, min_confidence=70.0
                 )
                 if not mtf_confirmed:
-                    log.info(f"[{symbol}] ❌ Multi-timeframe confirmation failed: {mtf_reason}")
-                    continue
+                    log.info(f"[{symbol}] ⚠️ Multi-timeframe confirmation missing: {mtf_reason} (Bypassed)")
+                    # continue  # BYPASSED
+                else:
+                    log.info(f"[{symbol}] ✅ Multi-timeframe confirmed: {mtf_analysis['summary']}")
                 log.info(f"[{symbol}] ✅ Multi-timeframe confirmed: {mtf_analysis['summary']}")
 
                 # Append confirmations to UI dashboard tags

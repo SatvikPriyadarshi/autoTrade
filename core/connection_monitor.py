@@ -180,12 +180,14 @@ class ConnectionMonitor:
                     if len(df) < count // 2:  # Less than half expected candles
                         issues.append(f"Incomplete {timeframe} data for {symbol}: {len(df)}/{count} candles")
                     
-                    # Check for stale data
+                    # Check for stale data using strict broker time
                     if 'time' in df.columns and len(df) > 0:
-                        latest_time = pd.to_datetime(df['time'].iloc[-1], unit='s')
-                        time_diff = (datetime.now() - latest_time).total_seconds()
-                        if time_diff > 300:  # 5 minutes stale
-                            issues.append(f"Stale {timeframe} data for {symbol}: {time_diff:.0f}s old")
+                        tick = mt5.symbol_info_tick(symbol)
+                        if tick and tick.time > 0:
+                            candle_time = int(df['time'].iloc[-1])
+                            time_diff = abs(tick.time - candle_time)
+                            if time_diff > 300:  # 5 minutes stale
+                                issues.append(f"Stale {timeframe} data for {symbol}: {time_diff}s old")
                     
                     # Check price validity
                     price_cols = ['open', 'high', 'low', 'close']
