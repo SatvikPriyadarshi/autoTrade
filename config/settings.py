@@ -71,6 +71,7 @@ RISK_PCT                      = 1.0
 MAX_DAILY_LOSS_USD            = float(os.getenv("MAX_DAILY_LOSS_USD", "100"))
 MAX_DAILY_LOSS_PCT            = 3.0
 MAX_RISK_PER_TRADE_USD        = float(os.getenv("MAX_RISK_PER_TRADE_USD", "20"))
+MAX_TRADE_LOSS_USD            = float(os.getenv("MAX_TRADE_LOSS_USD", "50"))  # Absolute max loss per trade (hard stop)
 MAX_TRADES_DAY                = 10
 MAX_TRADES_PER_SYMBOL_PER_DAY = int(os.getenv("MAX_TRADES_PER_SYMBOL_PER_DAY", "3"))
 SYMBOL_COOLDOWN_MIN           = int(os.getenv("SYMBOL_COOLDOWN_MIN", "10"))
@@ -89,17 +90,30 @@ MIN_LOT = {"EURUSD": 0.01, "GBPUSD": 0.01, "USDJPY": 0.01, "XAUUSD": 0.01}
 MAX_LOT = {"EURUSD": 5.00, "GBPUSD": 5.00, "USDJPY": 5.00, "XAUUSD": 2.00}
 
 # ──────────────────────────────────────────────
-#  POSITION MANAGEMENT (trailing stop / breakeven)
+#  POSITION MANAGEMENT (trailing stop / breakeven / partial TP)
 # ──────────────────────────────────────────────
 BREAKEVEN_TRIGGER_RR  = 1.0    # Move SL to breakeven when profit >= 1R
 BREAKEVEN_BUFFER_PIPS = 2      # Buffer above entry for BE (covers spread)
 TRAIL_TRIGGER_RR      = 1.5    # Start trailing after 1.5R profit
 TRAIL_STEP_RATIO      = 0.5    # Trail SL at 50% of risk distance behind price
 
+# Partial take-profit settings
+PARTIAL_TP_ENABLED     = os.getenv("PARTIAL_TP_ENABLED", "true").lower() == "true"
+PARTIAL_TP_TRIGGER_RR  = float(os.getenv("PARTIAL_TP_TRIGGER_RR", "1.0"))
+PARTIAL_TP_PERCENTAGE  = float(os.getenv("PARTIAL_TP_PERCENTAGE", "0.5"))
+PARTIAL_TP_MIN_LOT     = float(os.getenv("PARTIAL_TP_MIN_LOT", "0.02"))
+
+# Volume confirmation for breakeven
+VOLUME_CONFIRMATION_ENABLED = os.getenv("VOLUME_CONFIRMATION_ENABLED", "true").lower() == "true"
+VOLUME_CONFIRMATION_MIN_RATIO = float(os.getenv("VOLUME_CONFIRMATION_MIN_RATIO", "1.0"))  # Must be at least average volume
+
 # ──────────────────────────────────────────────
 #  INTRADAY / SCALPING MODE — disabled, trades run freely
 # ──────────────────────────────────────────────
 INTRADAY_MODE = False   # No forced session-end closes or stale-trade kills
+
+# Maximum trade duration in minutes (for stale trade detection)
+MAX_TRADE_DURATION_MIN = int(os.getenv("MAX_TRADE_DURATION_MIN", "480"))  # 8 hours default
 
 # ──────────────────────────────────────────────
 #  SESSION HOURS (UTC)
