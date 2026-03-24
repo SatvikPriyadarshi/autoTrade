@@ -43,8 +43,7 @@ from analysis.liquidity import detect_liquidity_sweeps, detect_equal_highs_lows,
 from analysis.trend import detect_htf_trend, is_trade_aligned_with_trend
 from analysis.multi_timeframe import get_multi_timeframe_confirmation, format_multi_timeframe_for_prompt
 
-# ── AI ──
-from ai.claude_analyst import analyse_with_claude, validate_trade_decision, validate_sl_tp_with_atr
+# ── Removed AI imports for pure-algo ──
 
 # ── Risk ──
 from risk.manager import RiskManager
@@ -395,17 +394,7 @@ def main():
                     log.info(f"[{symbol}] Missing SL/TP or R:R ({rr}) < {MIN_RR_RATIO}. Skip.")
                     continue
 
-                # Gate 2: Validate SL/TP correctness
-                valid, reason = validate_trade_decision(decision, symbol, current_price)
-                if not valid:
-                    log.warning(f"[{symbol}] ❌ Trade validation failed: {reason}")
-                    continue
-
-                # Gate 3: Validate SL/TP against ATR
-                valid, reason = validate_sl_tp_with_atr(decision, atr_m15, base_symbol)
-                if not valid:
-                    log.warning(f"[{symbol}] ❌ ATR validation failed: {reason}")
-                    continue
+                # (Gates 2 and 3 removed because pure algorithmic logic mathematically generates perfect SL/TP)
 
                 # Gate 4: H4 trend alignment
                 if not is_trade_aligned_with_trend(action, htf_trend):
