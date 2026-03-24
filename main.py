@@ -140,12 +140,35 @@ def run_algorithmic_decision(
 
     atr = atr_m15_raw.iloc[-1] if hasattr(atr_m15_raw, "iloc") else atr_m15_raw
 
-    # Filter out dead volume markets
-    if vol_ratio < 0.7:
-        decision["reason"] = f"Volume too low ({vol_ratio}x avg)"
-        return decision
+    # Check for active price inside any FVG first
+    active_fvg_type = None
+    level = 0.0
+    for fvg in fvgs:
+        if fvg["low"] <= current_price <= fvg["high"]:
+            active_fvg_type = fvg["type"]
+            level = fvg["low"] if fvg["type"] == "Bullish" else fvg["high"]
+            break
 
-    # M5 Candle Metrics (Checking the last fully closed candle)
+    if active_fvg_type:
+        # We are inside a zone! Let's mathematically verify it step-by-step for the Dashboard.
+        if vol_ratio < 0.7:
+            decision["reason"] = f"REJECT {active_fvg_type} FVG: Trading Volume extremely low ({vol_ratio}x)"
+            return decision
+
+        if active_fvg_type == "Bullish":
+            if trend_dir == "BEARISH" or not h1_bullish:
+                decision["reason"] = f"REJECT {active_fvg_type} FVG: H4/H1 trend is not Bullish"
+                return decision
+            if not is_strong_bullish_momentum:
+                decision["reason"] = f"WAIT IN {active_fvg_type} FVG: M5 lacks strong bullish closing momentum"
+                return decision
+        else:
+            if trend_dir == "BULLISH" or not h1_bearish:
+                decision["reason"] = f"REJECT {active_fvg_type} FVG: H4/H1 trend is not Bearish"
+                return decision
+            if not is_strong_bearish_momentum:
+                decision["reason"] = f"WAIT IN {active_fvg_type} FVG: M5 lacks strong bearish closing momentum"
+                return decision
     c_close = df_m5["close"].iloc[-2]
     c_open = df_m5["open"].iloc[-2]
     c_high = df_m5["high"].iloc[-2]
@@ -156,7 +179,7 @@ def run_algorithmic_decision(
     is_strong_bullish_momentum = (c_close > c_open) and (c_body / c_range > 0.5) and (c_close > c_high - (c_range * 0.3))
     is_strong_bearish_momentum = (c_close < c_open) and (c_body / c_range > 0.5) and (c_close < c_low + (c_range * 0.3))
 
-    # A) Bullish overlap
+    # A) Executable Bullish setup
     for fvg in fvgs:
         if fvg["type"] == "Bullish" and trend_dir in ["BULLISH", "NEUTRAL"] and h1_bullish:
             if fvg["low"] <= current_price <= fvg["high"]:
@@ -173,7 +196,7 @@ def run_algorithmic_decision(
                         "confluences": ["M15 FVG", "M5 Momentum Break", "H4+H1 Trend Alignment", f"Volume {vol_ratio}x"]
                     }
                     
-    # B) Bearish overlap
+    # B) Executable Bearish setup
     for fvg in fvgs:
         if fvg["type"] == "Bearish" and trend_dir in ["BEARISH", "NEUTRAL"] and h1_bearish:
             if fvg["low"] <= current_price <= fvg["high"]:
