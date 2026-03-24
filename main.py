@@ -422,7 +422,8 @@ def main():
                 confidence = decision.get("confidence", 0)
 
                 if action not in ("BUY", "SELL") or confidence < MIN_CONFIDENCE:
-                    log.info(f"[{symbol}] Decision: {action} (conf {confidence}%). No trade.")
+                    reason = decision.get("reason", "No valid setup")
+                    log.info(f"[{symbol}] {action}: {reason}")
                     continue
 
                 # ──────────────────────────────────────
