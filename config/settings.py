@@ -42,7 +42,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 # ──────────────────────────────────────────────
 #  SYMBOLS & TIMEFRAMES
 # ──────────────────────────────────────────────
-SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
+SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "USDCAD", "AUDUSD", "NZDUSD", "USDCHF", "EURGBP", "EURJPY", "GBPJPY", "AUDJPY"]
 
 SYMBOL_ALIASES = {
     "XAUUSD": ["XAUUSD", "GOLD", "XAUG"],
@@ -58,10 +58,9 @@ CANDLES_M5    = 30    # Last 30 M5 candles for entry confirmation
 
 # Per-symbol pip definitions  (1 pip = this many price units)
 PIP_VALUE = {
-    "EURUSD": 0.0001,
-    "GBPUSD": 0.0001,
-    "USDJPY": 0.01,
-    "XAUUSD": 0.01,
+    "EURUSD": 0.0001, "GBPUSD": 0.0001, "USDJPY": 0.01, "XAUUSD": 0.01,
+    "USDCAD": 0.0001, "AUDUSD": 0.0001, "NZDUSD": 0.0001, "USDCHF": 0.0001,
+    "EURGBP": 0.0001, "EURJPY": 0.01, "GBPJPY": 0.01, "AUDJPY": 0.01
 }
 
 # ──────────────────────────────────────────────
@@ -79,15 +78,20 @@ LOSS_COOLDOWN_MIN             = int(os.getenv("LOSS_COOLDOWN_MIN", "30"))
 MAX_CONSECUTIVE_LOSSES        = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
 
 # Spread limits (in points)
-MAX_SPREAD = {"EURUSD": 15, "GBPUSD": 20, "USDJPY": 15, "XAUUSD": 50}
+MAX_SPREAD = {
+    "EURUSD": 15, "GBPUSD": 20, "USDJPY": 15, "XAUUSD": 50,
+    "USDCAD": 25, "AUDUSD": 20, "NZDUSD": 25, "USDCHF": 25,
+    "EURGBP": 25, "EURJPY": 30, "GBPJPY": 35, "AUDJPY": 30
+}
 
 MIN_CONFIDENCE = 75
 MIN_RR_RATIO   = 2.0
 SLEEP_SEC      = 60
 
 # Lot size safety clamps per symbol
-MIN_LOT = {"EURUSD": 0.01, "GBPUSD": 0.01, "USDJPY": 0.01, "XAUUSD": 0.01}
-MAX_LOT = {"EURUSD": 5.00, "GBPUSD": 5.00, "USDJPY": 5.00, "XAUUSD": 2.00}
+MIN_LOT = {s: 0.01 for s in SYMBOLS}
+MAX_LOT = {s: 5.00 for s in SYMBOLS}
+MAX_LOT["XAUUSD"] = 2.00
 
 # ──────────────────────────────────────────────
 #  POSITION MANAGEMENT (trailing stop / breakeven / partial TP)
@@ -136,12 +140,20 @@ def _parse_hour_range(env_key: str, default_start: int, default_end: int) -> tup
 LONDON_START, LONDON_END = _parse_hour_range("LONDON_SESSION_UTC", 7, 11)
 NY_START, NY_END         = _parse_hour_range("NY_SESSION_UTC", 12, 21)
 
-# Per-symbol optimal session hours (UTC)
+# Per-symbol optimal session hours (UTC) updated to include Asian Sessions 24/5
 SYMBOL_SESSIONS = {
-    "EURUSD": {"best_hours": list(range(7, 16)),  "avoid_hours": [22, 23, 0, 1, 2, 3]},
-    "GBPUSD": {"best_hours": list(range(7, 16)),  "avoid_hours": [22, 23, 0, 1, 2, 3]},
-    "USDJPY": {"best_hours": list(range(0, 9)) + list(range(13, 21)), "avoid_hours": [10, 11, 12]},
-    "XAUUSD": {"best_hours": list(range(13, 21)), "avoid_hours": [0, 1, 2, 3, 4, 5]},
+    "EURUSD": {"best_hours": list(range(0, 24)), "avoid_hours": []},
+    "GBPUSD": {"best_hours": list(range(0, 24)), "avoid_hours": []},
+    "USDJPY": {"best_hours": list(range(0, 24)), "avoid_hours": []},
+    "USDCAD": {"best_hours": list(range(0, 24)), "avoid_hours": []},
+    "AUDUSD": {"best_hours": list(range(0, 24)), "avoid_hours": []},
+    "NZDUSD": {"best_hours": list(range(0, 24)), "avoid_hours": []},
+    "USDCHF": {"best_hours": list(range(0, 24)), "avoid_hours": []},
+    "EURGBP": {"best_hours": list(range(0, 24)), "avoid_hours": []},
+    "EURJPY": {"best_hours": list(range(0, 24)), "avoid_hours": []},
+    "GBPJPY": {"best_hours": list(range(0, 24)), "avoid_hours": []},
+    "AUDJPY": {"best_hours": list(range(0, 24)), "avoid_hours": []},
+    "XAUUSD": {"best_hours": list(range(0, 24)), "avoid_hours": []},
 }
 
 # ──────────────────────────────────────────────

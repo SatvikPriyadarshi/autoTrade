@@ -69,7 +69,7 @@ class PositionManager:
         log.info(f"[PositionManager] Tracking ticket {ticket} | {symbol} {direction} | "
                 f"Volume: {volume} | Risk: {risk_distance:.5f}")
 
-    def manage_all(self):
+    def manage_all(self) -> list[str]:
         """
         Main management loop — call this every iteration.
         Checks each tracked position for:
@@ -77,9 +77,11 @@ class PositionManager:
           2. Stale trade duration -> force close
           3. Breakeven trigger
           4. Trailing stop trigger
+        Returns a list of symbols that were closed during this cycle.
         """
+        closed_symbols = []
         if not self.tracked:
-            return
+            return closed_symbols
 
         # Get current open positions from MT5
         open_positions = mt5.positions_get() or []
@@ -92,6 +94,7 @@ class PositionManager:
                 # Position has been closed (by SL/TP or manually) -> track outcome
                 self._handle_closed_position(ticket, info)
                 closed_tickets.append(ticket)
+                closed_symbols.append(info["symbol"])
             else:
                 pos = next((p for p in open_positions if p.ticket == ticket), None)
                 if pos:
@@ -99,6 +102,7 @@ class PositionManager:
                     if self._is_stale_trade(info):
                         self._force_close_stale(ticket, info)
                         closed_tickets.append(ticket)
+                        closed_symbols.append(info["symbol"])
                     else:
                         # Position still open — manage SL
                         self._manage_open_position(ticket, info, pos)
@@ -106,6 +110,8 @@ class PositionManager:
         # Clean up closed positions from tracking
         for ticket in closed_tickets:
             self.tracked.pop(ticket, None)
+
+        return closed_symbols
 
     def _is_stale_trade(self, info: dict) -> bool:
         """Check if a trade has been open longer than MAX_TRADE_DURATION_MIN."""
@@ -179,75 +185,39 @@ class PositionManager:
         Includes profit + commission + swap for accuracy.
         """
         try:
-            now = datetime.now(timezone.utc)
-            from_time = now - timedelta(days=7)
+            # Safest approach: Query deals specifically tied to this position ticket directly
+            # This completely bypasses any Server vs Local timezone offsets!
+            found_deals = mt5.history_deals_get(position=ticket)
+            
+            if not found_deals:
+                # Fallback: Query massive timezone-agnostic date range to defeat MT5 server offsets
+                from datetime import datetime, timedelta
+                
+                # Using naive local time and stretching to capture anything regardless of timezone
+                now_local = datetime.now()
+                from_time = now_local - timedelta(days=7)
+                to_time = now_local + timedelta(days=2) # Future buffer forces MT5 to dump all latest deals!
+                
+                deals = mt5.history_deals_get(from_time, to_time) or []
+                
+                found_deals = []
+                for deal in deals:
+                    if getattr(deal, "position_id", 0) == ticket or getattr(deal, "ticket", 0) == ticket:
+                        found_deals.append(deal)
 
-            deals = mt5.history_deals_get(from_time, now) or []
-            if not deals:
-                log.warning(f"[PositionManager] No deal history found for ticket {ticket}")
+            if not found_deals:
+                log.warning(f"[PositionManager] Could not find any history deals for ticket {ticket}")
                 return 0.0
 
             total_pnl = 0.0
-            found_deals = []
             
-            # Strategy 1: Match by position_id (most reliable)
-            for deal in deals:
-                deal_position = getattr(deal, "position_id", 0)
-                if deal_position == ticket:
-                    found_deals.append(deal)
-            
-            # Strategy 2: If no position_id match, try matching by ticket (some brokers use ticket as position_id)
-            if not found_deals:
-                for deal in deals:
-                    deal_ticket = getattr(deal, "ticket", 0)
-                    if deal_ticket == ticket:
-                        found_deals.append(deal)
-            
-            # Strategy 3: Match by symbol and time window (fallback)
-            if not found_deals:
-                # Get position open time from tracked info
-                position_info = self.tracked.get(ticket, {})
-                open_time = position_info.get("open_time", now - timedelta(hours=1))
-                
-                for deal in deals:
-                    deal_symbol = getattr(deal, "symbol", "")
-                    deal_time = getattr(deal, "time", 0)
-                    if deal_time == 0:
-                        continue
-                    
-                    deal_dt = datetime.fromtimestamp(deal_time, timezone.utc)
-                    time_diff = abs((deal_dt - open_time).total_seconds())
-                    
-                    if deal_symbol == symbol and time_diff < 3600:  # Within 1 hour
-                        found_deals.append(deal)
-                        log.info(f"[PositionManager] Fallback match for ticket {ticket} by symbol/time")
-
-            if not found_deals:
-                log.warning(f"[PositionManager] Could not find any deals for ticket {ticket}")
-                return 0.0
-
             # Calculate total P&L from found deals
             for deal in found_deals:
-                deal_entry = getattr(deal, "entry", None)
-                close_entries = {
-                    getattr(mt5, "DEAL_ENTRY_OUT", 1),
-                    getattr(mt5, "DEAL_ENTRY_OUT_BY", 3),
-                    getattr(mt5, "DEAL_ENTRY_INOUT", 2),
-                }
-                
-                # Include all deals (opening and closing) for accurate P&L
                 profit = float(getattr(deal, "profit", 0.0))
                 commission = float(getattr(deal, "commission", 0.0))
                 swap = float(getattr(deal, "swap", 0.0))
-                
                 total_pnl += profit + commission + swap
                 
-                log.debug(
-                    f"[PositionManager] Deal {getattr(deal, 'ticket', 'N/A')} | "
-                    f"Entry: {deal_entry} | Profit: {profit:.2f} | "
-                    f"Commission: {commission:.2f} | Swap: {swap:.2f}"
-                )
-
             log.info(f"[PositionManager] Found {len(found_deals)} deals for ticket {ticket}, total P&L: ${total_pnl:.2f}")
             return total_pnl
 

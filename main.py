@@ -75,13 +75,11 @@ def _minutes_until_session_end() -> int:
 
 
 def is_trading_session() -> bool:
+    """Returns True 24/5. Prevents trading on weekends."""
     now = datetime.now(GMT)
     if now.weekday() >= 5:
         return False
-    hour = now.hour
-    london = LONDON_START <= hour < LONDON_END
-    ny     = NY_START <= hour < NY_END
-    return london or ny
+    return True
 
 
 def is_symbol_in_optimal_session(base_symbol: str) -> bool:
@@ -121,7 +119,7 @@ def is_near_poi(current_price: float, smc_data: dict, base_symbol: str) -> bool:
 # ──────────────────────────────────────────────
 def run_algorithmic_decision(
     symbol: str, current_price: float, df_m5, smc_data: dict, atr_m15_raw, 
-    htf_trend: dict, volume_info: dict, df_h1
+    htf_trend: dict, volume_info: dict, df_h1, sr_data: dict
 ) -> dict:
     """
     100% Algorithmic mathematical logic.
@@ -132,6 +130,33 @@ def run_algorithmic_decision(
     fvgs = smc_data.get("fvgs", [])
     vol_ratio = volume_info.get("vol_ratio", 1.0)
     
+    def calculate_dynamic_tp(action_dir: str, current: float, sl_price: float) -> tuple[float, float]:
+        """Calculates dynamic RR between 2.0 and 4.0 using H1 Support/Resistance."""
+        risk_dist = abs(float(current) - float(sl_price))
+        if risk_dist <= 0: return float(current), 2.0
+        
+        if action_dir == "BUY":
+            res_levels = sr_data.get("resistance", [])
+            valid_res = sorted([float(r) for r in res_levels if float(r) > float(current)])
+            for r in valid_res:
+                rr = float((r - float(current)) / risk_dist)
+                if 2.0 <= rr <= 4.0:
+                    return r, float(f"{rr:.2f}")
+                elif rr > 4.0:
+                    return float(current) + (risk_dist * 4.0), 4.0
+            return float(current) + (risk_dist * 2.0), 2.0
+        else:
+            sup_levels = sr_data.get("support", [])
+            valid_sup = sorted([float(s) for s in sup_levels if float(s) < float(current)], reverse=True)
+            for s in valid_sup:
+                rr = float((float(current) - s) / risk_dist)
+                if 2.0 <= rr <= 4.0:
+                    return s, float(f"{rr:.2f}")
+                elif rr > 4.0:
+                    return float(current) - (risk_dist * 4.0), 4.0
+            return float(current) - (risk_dist * 2.0), 2.0
+
+    
     # Check H1 Alignment
     h1_ema20 = df_h1["close"].ewm(span=20, adjust=False).mean().iloc[-1]
     h1_ema50 = df_h1["close"].ewm(span=50, adjust=False).mean().iloc[-1]
@@ -139,6 +164,41 @@ def run_algorithmic_decision(
     h1_bearish = h1_ema20 < h1_ema50
 
     atr = atr_m15_raw.iloc[-1] if hasattr(atr_m15_raw, "iloc") else atr_m15_raw
+
+    # Filter out dead volume markets
+    if vol_ratio < 0.7:
+        decision["reason"] = f"Volume too low ({vol_ratio}x avg)"
+        return decision
+
+    # ──────────────────────────────────────────────
+    #  M5 CANDLESTICK MATH (Run regardless of FVG)
+    # ──────────────────────────────────────────────
+    c_close = df_m5["close"].iloc[-2]
+    c_open = df_m5["open"].iloc[-2]
+    c_high = df_m5["high"].iloc[-2]
+    c_low = df_m5["low"].iloc[-2]
+    c_body = abs(c_close - c_open)
+    c_range = c_high - c_low if (c_high - c_low) > 0 else 0.00001
+    
+    c_open_close_min = min(c_open, c_close)
+    c_open_close_max = max(c_open, c_close)
+
+    is_strong_bullish_momentum = (c_close > c_open) and (c_body / c_range > 0.5) and (c_close > c_high - (c_range * 0.3))
+    is_strong_bearish_momentum = (c_close < c_open) and (c_body / c_range > 0.5) and (c_close < c_low + (c_range * 0.3))
+
+    # M5 Hammer / Pinbar
+    is_bullish_hammer = (c_open_close_min - c_low > c_body * 2.0) and (c_high - c_open_close_max < c_range * 0.2) and (c_range > 0.00001)
+    is_bearish_hammer = (c_high - c_open_close_max > c_body * 2.0) and (c_open_close_min - c_low < c_range * 0.2) and (c_range > 0.00001)
+
+    # M5 Liquidity Sweep (Swept lowest low / highest high of the previous 10 candles)
+    recent_lows = df_m5["low"].iloc[-12:-2].min()
+    recent_highs = df_m5["high"].iloc[-12:-2].max()
+    is_bullish_sweep = (c_low < recent_lows) and (c_close > recent_lows)
+    is_bearish_sweep = (c_high > recent_highs) and (c_close < recent_highs)
+
+    valid_bullish_trigger = is_strong_bullish_momentum or is_bullish_hammer or is_bullish_sweep
+    valid_bearish_trigger = is_strong_bearish_momentum or is_bearish_hammer or is_bearish_sweep
+
 
     # Check for active price inside any FVG first
     active_fvg_type = None
@@ -159,58 +219,54 @@ def run_algorithmic_decision(
             if trend_dir == "BEARISH" or not h1_bullish:
                 decision["reason"] = f"REJECT {active_fvg_type} FVG: H4/H1 trend is not Bullish"
                 return decision
-            if not is_strong_bullish_momentum:
-                decision["reason"] = f"WAIT IN {active_fvg_type} FVG: M5 lacks strong bullish closing momentum"
+            if not valid_bullish_trigger:
+                decision["reason"] = f"WAIT IN {active_fvg_type} FVG: M5 lacks momentum/pinbar/sweep"
                 return decision
         else:
             if trend_dir == "BULLISH" or not h1_bearish:
                 decision["reason"] = f"REJECT {active_fvg_type} FVG: H4/H1 trend is not Bearish"
                 return decision
-            if not is_strong_bearish_momentum:
-                decision["reason"] = f"WAIT IN {active_fvg_type} FVG: M5 lacks strong bearish closing momentum"
+            if not valid_bearish_trigger:
+                decision["reason"] = f"WAIT IN {active_fvg_type} FVG: M5 lacks momentum/pinbar/sweep"
                 return decision
-    c_close = df_m5["close"].iloc[-2]
-    c_open = df_m5["open"].iloc[-2]
-    c_high = df_m5["high"].iloc[-2]
-    c_low = df_m5["low"].iloc[-2]
-    c_body = abs(c_close - c_open)
-    c_range = c_high - c_low if (c_high - c_low) > 0 else 0.00001
-    
-    is_strong_bullish_momentum = (c_close > c_open) and (c_body / c_range > 0.5) and (c_close > c_high - (c_range * 0.3))
-    is_strong_bearish_momentum = (c_close < c_open) and (c_body / c_range > 0.5) and (c_close < c_low + (c_range * 0.3))
-
-    # A) Executable Bullish setup
+    # A) Executable Bullish FVG setup
     for fvg in fvgs:
         if fvg["type"] == "Bullish" and trend_dir in ["BULLISH", "NEUTRAL"] and h1_bullish:
             if fvg["low"] <= current_price <= fvg["high"]:
-                if is_strong_bullish_momentum:
+                if valid_bullish_trigger:
                     sl = fvg["low"] - (atr * 0.5)
-                    tp = current_price + ((current_price - sl) * 2.0)
+                    tp, rr = calculate_dynamic_tp("BUY", current_price, sl)
+                    
+                    trigger_reason = "Liquidity Sweep" if is_bullish_sweep else "Bullish Hammer" if is_bullish_hammer else "Strong Bullish Momentum"
+                    
                     return {
                         "action": "BUY",
-                        "reason": "SETUP: Price in M15 FVG | TRIGGER: Strong M5 Bullish Engulfing/Momentum | TARGET: 1:2 R:R",
+                        "reason": f"SETUP: Price in M15 FVG | TRIGGER: M5 {trigger_reason} | TARGET: 1:{rr} R:R",
                         "confidence": 92,
                         "entry": current_price,
-                        "sl": sl, "tp": tp, "rr_ratio": 2.0,
+                        "sl": sl, "tp": tp, "rr_ratio": rr,
                         "key_level": f"M15 Bullish FVG {fvg['low']:.5f}",
-                        "confluences": ["M15 FVG", "M5 Momentum Break", "H4+H1 Trend Alignment", f"Volume {vol_ratio}x"]
+                        "confluences": ["M15 FVG", f"M5 {trigger_reason}", "H4+H1 Trend Validation", f"Target 1:{rr}R"]
                     }
                     
-    # B) Executable Bearish setup
+    # B) Executable Bearish FVG setup
     for fvg in fvgs:
         if fvg["type"] == "Bearish" and trend_dir in ["BEARISH", "NEUTRAL"] and h1_bearish:
             if fvg["low"] <= current_price <= fvg["high"]:
-                if is_strong_bearish_momentum:
+                if valid_bearish_trigger:
                     sl = fvg["high"] + (atr * 0.5)
-                    tp = current_price - ((sl - current_price) * 2.0)
+                    tp, rr = calculate_dynamic_tp("SELL", current_price, sl)
+                    
+                    trigger_reason = "Liquidity Sweep" if is_bearish_sweep else "Bearish Pinbar" if is_bearish_hammer else "Strong Bearish Momentum"
+                    
                     return {
                         "action": "SELL",
-                        "reason": "SETUP: Price in M15 FVG | TRIGGER: Strong M5 Bearish Engulfing/Momentum | TARGET: 1:2 R:R",
+                        "reason": f"SETUP: Price in M15 FVG | TRIGGER: M5 {trigger_reason} | TARGET: 1:{rr} R:R",
                         "confidence": 92,
                         "entry": current_price,
-                        "sl": sl, "tp": tp, "rr_ratio": 2.0,
+                        "sl": sl, "tp": tp, "rr_ratio": rr,
                         "key_level": f"M15 Bearish FVG {fvg['high']:.5f}",
-                        "confluences": ["M15 FVG", "M5 Momentum Break", "H4+H1 Trend Alignment", f"Volume {vol_ratio}x"]
+                        "confluences": ["M15 FVG", f"M5 {trigger_reason}", "H4+H1 Trend Validation", f"Target 1:{rr}R"]
                     }
                     
     return decision
@@ -285,7 +341,13 @@ def main():
                 symbol_last_was_loss   = {s: False for s in tradable_symbols}
 
             # ── Manage open positions (breakeven, trailing, outcome tracking) ──
-            pos_manager.manage_all()
+            recently_closed = pos_manager.manage_all()
+            if recently_closed:
+                for closed_base in recently_closed:
+                    for s in tradable_symbols:
+                        if get_base_symbol(s) == closed_base:
+                            symbol_last_trade_time[s] = now
+                            log.info(f"[{s}] Position closed. 10m Cooldown timer started.")
 
             # ── Session check ──
             if not is_trading_session():
@@ -403,7 +465,8 @@ def main():
                     atr_m15_raw=atr_m15,
                     htf_trend=htf_trend,
                     volume_info=volume_info,
-                    df_h1=df_h1
+                    df_h1=df_h1,
+                    sr_data=sr_data
                 )
 
                 # ── Log the signal ──
@@ -496,8 +559,6 @@ def main():
                 if success:
                     risk_mgr.record_trade()
                     symbol_trades_today[symbol] = symbol_trades_today.get(symbol, 0) + 1
-                    symbol_last_trade_time[symbol] = now
-                    symbol_last_was_loss[symbol] = False
 
                     # Log the trade
                     trade_log.log_trade(
