@@ -127,7 +127,7 @@ def run_algorithmic_decision(
     100% Algorithmic mathematical logic.
     Searches for valid M15 FVGs aligned with H4 + H1 trend, confirmed by strong M5 momentum and volume.
     """
-    decision = {"action": "HOLD", "reason": "No valid algorithmic setup", "confidence": 0}
+    decision = {"action": "HOLD", "reason": "No valid algorithmic setup", "confidence": 50}
     trend_dir = htf_trend.get("direction", "NEUTRAL")
     fvgs = smc_data.get("fvgs", [])
     vol_ratio = volume_info.get("vol_ratio", 1.0)
@@ -393,12 +393,6 @@ def main():
                 near = is_near_poi(current_price, smc_data, base_symbol)
                 if not near and not patterns and not sweeps:
                     continue
-
-                # ── Cost Control: Only analyze ONE time per M5 candle ──
-                current_m5_time = df_m5['time'].iloc[-1]
-                if symbol_last_analyzed_m5.get(symbol) == current_m5_time:
-                    continue
-                symbol_last_analyzed_m5[symbol] = current_m5_time
 
                 # ── PURE ALGORITHMIC ENGINE ──
                 decision = run_algorithmic_decision(
