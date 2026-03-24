@@ -120,55 +120,74 @@ def is_near_poi(current_price: float, smc_data: dict, base_symbol: str) -> bool:
 #  PURE ALGORITHMIC DECISION ENGINE
 # ──────────────────────────────────────────────
 def run_algorithmic_decision(
-    symbol: str, current_price: float, df_m5, smc_data: dict, atr_m15_raw, htf_trend: dict
+    symbol: str, current_price: float, df_m5, smc_data: dict, atr_m15_raw, 
+    htf_trend: dict, volume_info: dict, df_h1
 ) -> dict:
     """
-    100% Algorithmic mathematical logic, completely replacing Claude AI.
-    Searches for valid M15 FVGs aligned with H4 trend, confirmed by M5 momentum.
+    100% Algorithmic mathematical logic.
+    Searches for valid M15 FVGs aligned with H4 + H1 trend, confirmed by strong M5 momentum and volume.
     """
     decision = {"action": "HOLD", "reason": "No valid algorithmic setup", "confidence": 0}
     trend_dir = htf_trend.get("direction", "NEUTRAL")
     fvgs = smc_data.get("fvgs", [])
+    vol_ratio = volume_info.get("vol_ratio", 1.0)
     
-    # Handle pandas series vs float
+    # Check H1 Alignment
+    h1_ema20 = df_h1["close"].ewm(span=20, adjust=False).mean().iloc[-1]
+    h1_ema50 = df_h1["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+    h1_bullish = h1_ema20 > h1_ema50
+    h1_bearish = h1_ema20 < h1_ema50
+
     atr = atr_m15_raw.iloc[-1] if hasattr(atr_m15_raw, "iloc") else atr_m15_raw
+
+    # Filter out dead volume markets
+    if vol_ratio < 0.7:
+        decision["reason"] = f"Volume too low ({vol_ratio}x avg)"
+        return decision
+
+    # M5 Candle Metrics (Checking the last fully closed candle)
+    c_close = df_m5["close"].iloc[-2]
+    c_open = df_m5["open"].iloc[-2]
+    c_high = df_m5["high"].iloc[-2]
+    c_low = df_m5["low"].iloc[-2]
+    c_body = abs(c_close - c_open)
+    c_range = c_high - c_low if (c_high - c_low) > 0 else 0.00001
+    
+    is_strong_bullish_momentum = (c_close > c_open) and (c_body / c_range > 0.5) and (c_close > c_high - (c_range * 0.3))
+    is_strong_bearish_momentum = (c_close < c_open) and (c_body / c_range > 0.5) and (c_close < c_low + (c_range * 0.3))
 
     # A) Bullish overlap
     for fvg in fvgs:
-        if fvg["type"] == "Bullish" and trend_dir in ["BULLISH", "NEUTRAL"]:
+        if fvg["type"] == "Bullish" and trend_dir in ["BULLISH", "NEUTRAL"] and h1_bullish:
             if fvg["low"] <= current_price <= fvg["high"]:
-                last_m5_close = df_m5["close"].iloc[-2]
-                last_m5_open  = df_m5["open"].iloc[-2]
-                if last_m5_close > last_m5_open:  # M5 bullish confirmation
+                if is_strong_bullish_momentum:
                     sl = fvg["low"] - (atr * 0.5)
                     tp = current_price + ((current_price - sl) * 2.0)
                     return {
                         "action": "BUY",
-                        "reason": "SETUP: Price in Bullish M15 FVG | TRIGGER: M5 Bullish Close | TARGET: 1:2 Algorithmic RR",
-                        "confidence": 90,
+                        "reason": "SETUP: Price in M15 FVG | TRIGGER: Strong M5 Bullish Engulfing/Momentum | TARGET: 1:2 R:R",
+                        "confidence": 92,
                         "entry": current_price,
                         "sl": sl, "tp": tp, "rr_ratio": 2.0,
                         "key_level": f"M15 Bullish FVG {fvg['low']:.5f}",
-                        "confluences": ["M15 FVG", "M5 Bullish Close"]
+                        "confluences": ["M15 FVG", "M5 Momentum Break", "H4+H1 Trend Alignment", f"Volume {vol_ratio}x"]
                     }
                     
     # B) Bearish overlap
     for fvg in fvgs:
-        if fvg["type"] == "Bearish" and trend_dir in ["BEARISH", "NEUTRAL"]:
+        if fvg["type"] == "Bearish" and trend_dir in ["BEARISH", "NEUTRAL"] and h1_bearish:
             if fvg["low"] <= current_price <= fvg["high"]:
-                last_m5_close = df_m5["close"].iloc[-2]
-                last_m5_open  = df_m5["open"].iloc[-2]
-                if last_m5_close < last_m5_open:  # M5 bearish confirmation
+                if is_strong_bearish_momentum:
                     sl = fvg["high"] + (atr * 0.5)
                     tp = current_price - ((sl - current_price) * 2.0)
                     return {
                         "action": "SELL",
-                        "reason": "SETUP: Price in Bearish M15 FVG | TRIGGER: M5 Bearish Close | TARGET: 1:2 Algorithmic RR",
-                        "confidence": 90,
+                        "reason": "SETUP: Price in M15 FVG | TRIGGER: Strong M5 Bearish Engulfing/Momentum | TARGET: 1:2 R:R",
+                        "confidence": 92,
                         "entry": current_price,
                         "sl": sl, "tp": tp, "rr_ratio": 2.0,
                         "key_level": f"M15 Bearish FVG {fvg['high']:.5f}",
-                        "confluences": ["M15 FVG", "M5 Bearish Close"]
+                        "confluences": ["M15 FVG", "M5 Momentum Break", "H4+H1 Trend Alignment", f"Volume {vol_ratio}x"]
                     }
                     
     return decision
@@ -368,7 +387,9 @@ def main():
                     df_m5=df_m5,
                     smc_data=smc_data,
                     atr_m15_raw=atr_m15,
-                    htf_trend=htf_trend
+                    htf_trend=htf_trend,
+                    volume_info=volume_info,
+                    df_h1=df_h1
                 )
 
                 # ── Log the signal ──
