@@ -142,6 +142,53 @@ class TradeLogger:
             ])
 
     # ──────────────────────────────────────────
+    #  PARTIAL CLOSE LOGGING
+    # ──────────────────────────────────────────
+    def update_partial_close(self, ticket: int, percentage: float, pnl: float, reason: str = ""):
+        """
+        Log a partial close of a position.
+        Creates a new entry in trades.csv with PARTIAL status.
+        """
+        # Read existing trades to find the original trade
+        trades = []
+        with open(self.trades_file, "r", newline="") as f:
+            reader = csv.reader(f)
+            trades = list(reader)
+        
+        if len(trades) <= 1:  # Header only
+            return
+        
+        # Find the original trade by ticket
+        for i, row in enumerate(trades[1:], 1):  # Skip header
+            if len(row) >= 13 and row[12] == str(ticket):  # ticket is column 12
+                # Create partial close entry
+                partial_ts = datetime.now(GMT).strftime("%Y-%m-%d %H:%M:%S")
+                partial_row = [
+                    partial_ts,
+                    row[1],  # symbol
+                    f"PARTIAL_{row[2]}",  # direction with PARTIAL prefix
+                    float(row[3]) * percentage,  # partial volume
+                    row[4],  # entry
+                    row[5],  # sl
+                    row[6],  # tp
+                    row[7],  # rr_ratio
+                    row[8],  # confidence
+                    f"Partial close {percentage*100:.0f}%: {reason}",
+                    "PARTIAL",
+                    pnl,
+                    ticket,
+                ]
+                
+                # Append partial close
+                with open(self.trades_file, "a", newline="") as f:
+                    csv.writer(f).writerow(partial_row)
+                
+                log.info(f"[TradeLogger] Logged partial close {percentage*100:.0f}% for ticket {ticket}, P&L: ${pnl:.2f}")
+                return
+        
+        log.warning(f"[TradeLogger] Could not find original trade for ticket {ticket}")
+
+    # ──────────────────────────────────────────
     #  TRADE OUTCOME UPDATE
     # ──────────────────────────────────────────
     def update_trade_status(self, ticket: int, status: str, pnl: float):

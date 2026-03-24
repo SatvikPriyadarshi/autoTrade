@@ -32,6 +32,8 @@ from core.mt5_client import (
     get_volume_profile, place_order,
 )
 from core.position_manager import PositionManager
+from core.connection_monitor import connection_monitor
+from core.error_handler import check_mt5_connection
 
 # ── Analysis ──
 from analysis.smc import detect_order_blocks, detect_fvg, detect_bos_choch
@@ -39,6 +41,7 @@ from analysis.patterns import detect_chart_patterns, confirm_m5_entry
 from analysis.support_resistance import detect_support_resistance, format_sr_for_prompt
 from analysis.liquidity import detect_liquidity_sweeps, detect_equal_highs_lows, format_liquidity_for_prompt
 from analysis.trend import detect_htf_trend, is_trade_aligned_with_trend
+from analysis.multi_timeframe import get_multi_timeframe_confirmation, format_multi_timeframe_for_prompt
 
 # ── AI ──
 from ai.claude_analyst import analyse_with_claude, validate_trade_decision, validate_sl_tp_with_atr
@@ -138,6 +141,10 @@ def main():
     risk_mgr    = RiskManager()
     trade_log   = TradeLogger()
     pos_manager = PositionManager(trade_log, risk_mgr)
+    
+    # Start connection health monitoring
+    connection_monitor.start_monitoring()
+    log.info("Connection health monitor started")
 
     # Per-symbol state
     symbol_trades_today     = {s: 0 for s in tradable_symbols}
@@ -153,6 +160,17 @@ def main():
             # ── Connection health check ──
             if not ensure_connected():
                 log.error("Cannot reconnect to MT5. Retrying in 60s...")
+                time.sleep(60)
+                continue
+            
+            # ── System health check ──
+            is_healthy, health_reason = connection_monitor.is_healthy_for_trading()
+            if not is_healthy:
+                log.warning(f"System health check failed: {health_reason}")
+                log.warning("Skipping trading cycle, performing health check...")
+                health_status = connection_monitor.check_health()
+                for issue in health_status.get("issues", [])[:3]:
+                    log.warning(f"  - {issue}")
                 time.sleep(60)
                 continue
 
@@ -349,11 +367,26 @@ def main():
                     continue
                 log.info(f"[{symbol}] ✅ M5 confirmed: {m5_pattern}")
 
-                # Append M5 confirmation to UI dashboard tags
+                # Gate 7: Multi-timeframe confirmation (M5 + M15 + H1 alignment)
+                mtf_confirmed, mtf_reason, mtf_analysis = get_multi_timeframe_confirmation(
+                    symbol, action, df_m5, df_m15, df_h1, min_confidence=70.0
+                )
+                if not mtf_confirmed:
+                    log.info(f"[{symbol}] ❌ Multi-timeframe confirmation failed: {mtf_reason}")
+                    continue
+                log.info(f"[{symbol}] ✅ Multi-timeframe confirmed: {mtf_analysis['summary']}")
+
+                # Append confirmations to UI dashboard tags
+                confirmations = []
+                if m5_ok:
+                    confirmations.append(m5_pattern)
+                if mtf_confirmed:
+                    confirmations.append(f"MTF_{mtf_analysis.get('confidence', 0):.0f}%")
+                
                 if "confluences" in decision and isinstance(decision["confluences"], list):
-                    decision["confluences"].append(m5_pattern)
-                elif "confluences" not in decision:
-                    decision["confluences"] = [m5_pattern]
+                    decision["confluences"].extend(confirmations)
+                elif confirmations:
+                    decision["confluences"] = confirmations
 
                 # ──────────────────────────────────────
                 #  POSITION SIZING & EXECUTION
@@ -395,6 +428,7 @@ def main():
                         entry=entry,
                         sl=sl,
                         tp=tp,
+                        volume=lot,  # Added for partial TP tracking
                     )
 
                     log.info(f"[{symbol}] ✅ TRADE PLACED: {action} {lot} lots | SL={sl} TP={tp} | Ticket={ticket}")
