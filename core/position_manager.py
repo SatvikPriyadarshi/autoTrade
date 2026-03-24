@@ -15,8 +15,11 @@ from config.settings import (
     BREAKEVEN_TRIGGER_RR, BREAKEVEN_BUFFER_PIPS,
     TRAIL_TRIGGER_RR, TRAIL_STEP_RATIO,
     MAX_TRADE_DURATION_MIN, INTRADAY_MODE,
+    PARTIAL_TP_ENABLED, PARTIAL_TP_TRIGGER_RR, 
+    PARTIAL_TP_PERCENTAGE, PARTIAL_TP_MIN_LOT,
+    VOLUME_CONFIRMATION_ENABLED, VOLUME_CONFIRMATION_MIN_RATIO,
 )
-from core.mt5_client import modify_position_sl, close_position
+from core.mt5_client import modify_position_sl, close_position, close_partial_position, get_current_volume_profile
 
 log = logging.getLogger("smc_bot")
 
@@ -45,6 +48,7 @@ class PositionManager:
         entry: float,
         sl: float,
         tp: float,
+        volume: float,  # Added to track position size for partial TP
     ):
         """Register a newly opened trade for management."""
         risk_distance = abs(entry - sl)
@@ -56,10 +60,14 @@ class PositionManager:
             "tp":             tp,
             "original_sl":    sl,
             "risk_distance":  risk_distance,
+            "volume":         volume,  # Track volume for partial TP
             "be_applied":     False,
+            "partial_tp_applied": False,  # Track if partial TP has been taken
+            "remaining_volume": volume,  # Track remaining volume after partial TP
             "open_time":      datetime.now(timezone.utc),
         }
-        log.info(f"[PositionManager] Tracking ticket {ticket} | {symbol} {direction} | Risk: {risk_distance:.5f}")
+        log.info(f"[PositionManager] Tracking ticket {ticket} | {symbol} {direction} | "
+                f"Volume: {volume} | Risk: {risk_distance:.5f}")
 
     def manage_all(self):
         """
@@ -167,7 +175,7 @@ class PositionManager:
 
     def _get_closed_pnl(self, ticket: int, symbol: str) -> float:
         """
-        Look up the realized P&L from MT5 deal history for a closed position.
+        Robust P&L lookup from MT5 deal history with multiple matching strategies.
         Includes profit + commission + swap for accuracy.
         """
         try:
@@ -175,45 +183,95 @@ class PositionManager:
             from_time = now - timedelta(days=7)
 
             deals = mt5.history_deals_get(from_time, now) or []
+            if not deals:
+                log.warning(f"[PositionManager] No deal history found for ticket {ticket}")
+                return 0.0
 
             total_pnl = 0.0
-            found = False
+            found_deals = []
+            
+            # Strategy 1: Match by position_id (most reliable)
             for deal in deals:
-                # Match deals by position ID
                 deal_position = getattr(deal, "position_id", 0)
-                if deal_position != ticket:
-                    continue
+                if deal_position == ticket:
+                    found_deals.append(deal)
+            
+            # Strategy 2: If no position_id match, try matching by ticket (some brokers use ticket as position_id)
+            if not found_deals:
+                for deal in deals:
+                    deal_ticket = getattr(deal, "ticket", 0)
+                    if deal_ticket == ticket:
+                        found_deals.append(deal)
+            
+            # Strategy 3: Match by symbol and time window (fallback)
+            if not found_deals:
+                # Get position open time from tracked info
+                position_info = self.tracked.get(ticket, {})
+                open_time = position_info.get("open_time", now - timedelta(hours=1))
+                
+                for deal in deals:
+                    deal_symbol = getattr(deal, "symbol", "")
+                    deal_time = getattr(deal, "time", 0)
+                    if deal_time == 0:
+                        continue
+                    
+                    deal_dt = datetime.fromtimestamp(deal_time, timezone.utc)
+                    time_diff = abs((deal_dt - open_time).total_seconds())
+                    
+                    if deal_symbol == symbol and time_diff < 3600:  # Within 1 hour
+                        found_deals.append(deal)
+                        log.info(f"[PositionManager] Fallback match for ticket {ticket} by symbol/time")
 
-                # Only count closing deals
+            if not found_deals:
+                log.warning(f"[PositionManager] Could not find any deals for ticket {ticket}")
+                return 0.0
+
+            # Calculate total P&L from found deals
+            for deal in found_deals:
                 deal_entry = getattr(deal, "entry", None)
                 close_entries = {
                     getattr(mt5, "DEAL_ENTRY_OUT", 1),
                     getattr(mt5, "DEAL_ENTRY_OUT_BY", 3),
                     getattr(mt5, "DEAL_ENTRY_INOUT", 2),
                 }
-                if deal_entry in close_entries:
-                    profit     = float(getattr(deal, "profit", 0.0))
-                    commission = float(getattr(deal, "commission", 0.0))
-                    swap       = float(getattr(deal, "swap", 0.0))
-                    total_pnl += profit + commission + swap
-                    found = True
+                
+                # Include all deals (opening and closing) for accurate P&L
+                profit = float(getattr(deal, "profit", 0.0))
+                commission = float(getattr(deal, "commission", 0.0))
+                swap = float(getattr(deal, "swap", 0.0))
+                
+                total_pnl += profit + commission + swap
+                
+                log.debug(
+                    f"[PositionManager] Deal {getattr(deal, 'ticket', 'N/A')} | "
+                    f"Entry: {deal_entry} | Profit: {profit:.2f} | "
+                    f"Commission: {commission:.2f} | Swap: {swap:.2f}"
+                )
 
-            if not found:
-                log.warning(f"[PositionManager] Could not find close deals for ticket {ticket}")
-
+            log.info(f"[PositionManager] Found {len(found_deals)} deals for ticket {ticket}, total P&L: ${total_pnl:.2f}")
             return total_pnl
 
         except Exception as e:
             log.error(f"[PositionManager] Error fetching P&L for ticket {ticket}: {e}")
+            # Try one more fallback: check if position still exists in MT5
+            try:
+                positions = mt5.positions_get(ticket=ticket)
+                if positions:
+                    pos = positions[0]
+                    # If position still exists, return current profit
+                    return float(getattr(pos, "profit", 0.0))
+            except Exception:
+                pass
             return 0.0
 
     def _manage_open_position(self, ticket: int, info: dict, pos):
-        """Apply breakeven and trailing stop logic to an open position."""
+        """Apply breakeven, partial TP, and trailing stop logic to an open position."""
         entry          = info["entry"]
         risk_distance  = info["risk_distance"]
         direction      = info["direction"]
         current_price  = pos.price_current
         current_sl     = pos.sl
+        current_volume = pos.volume
 
         if risk_distance <= 0:
             return
@@ -230,20 +288,58 @@ class PositionManager:
         pip = PIP_VALUE.get(base_symbol, 0.0001)
         be_buffer = BREAKEVEN_BUFFER_PIPS * pip
 
+        # -- PARTIAL TAKE-PROFIT: Close 50% at 1R profit --
+        if (PARTIAL_TP_ENABLED and not info["partial_tp_applied"] and 
+            profit_in_r >= PARTIAL_TP_TRIGGER_RR and
+            current_volume >= PARTIAL_TP_MIN_LOT):
+            
+            # Check if we have enough volume to take partial profit
+            if current_volume * PARTIAL_TP_PERCENTAGE >= 0.01:  # Minimum lot size
+                success, closed_pnl = close_partial_position(ticket, PARTIAL_TP_PERCENTAGE)
+                if success:
+                    info["partial_tp_applied"] = True
+                    info["remaining_volume"] = current_volume * (1 - PARTIAL_TP_PERCENTAGE)
+                    
+                    # Update trade logger with partial close
+                    self.trade_logger.update_partial_close(
+                        ticket, 
+                        PARTIAL_TP_PERCENTAGE, 
+                        closed_pnl,
+                        f"Partial TP at {profit_in_r:.1f}R"
+                    )
+                    
+                    log.info(f"[PositionManager] PARTIAL TP {PARTIAL_TP_PERCENTAGE*100:.0f}% | "
+                            f"Ticket {ticket} | Closed {PARTIAL_TP_PERCENTAGE*100:.0f}% at {profit_in_r:.1f}R")
+                else:
+                    log.warning(f"[PositionManager] Failed to take partial TP for ticket {ticket}")
+
         # -- BREAKEVEN: Move SL to entry when profit >= 1R --
         if not info["be_applied"] and profit_in_r >= BREAKEVEN_TRIGGER_RR:
-            if direction == "BUY":
-                new_sl = entry + be_buffer
-                if current_sl < new_sl:
-                    if modify_position_sl(ticket, new_sl):
-                        info["be_applied"] = True
-                        log.info(f"[PositionManager] BREAKEVEN | Ticket {ticket} | New SL: {new_sl:.5f}")
-            else:  # SELL
-                new_sl = entry - be_buffer
-                if current_sl > new_sl or current_sl == 0:
-                    if modify_position_sl(ticket, new_sl):
-                        info["be_applied"] = True
-                        log.info(f"[PositionManager] BREAKEVEN | Ticket {ticket} | New SL: {new_sl:.5f}")
+            can_breakeven = True
+            
+            if VOLUME_CONFIRMATION_ENABLED:
+                vol_profile = get_current_volume_profile(info["symbol"])
+                if vol_profile and vol_profile.get("available", False): # Use .get() defensively 
+                    # Only move to breakeven if volume is rising or above average confirmation threshold
+                    has_volume = vol_profile.get("rising", False) or vol_profile.get("ratio", 0) >= VOLUME_CONFIRMATION_MIN_RATIO
+                    if not has_volume:
+                        can_breakeven = False
+                        log.debug(f"[PositionManager] Delaying BE for {ticket} due to low volume "
+                                  f"(ratio: {vol_profile.get('ratio', 0):.2f}, rising: {vol_profile.get('rising', False)})")
+
+            if can_breakeven:
+                if direction == "BUY":
+                    new_sl = entry + be_buffer
+                    if current_sl < new_sl:
+                        if modify_position_sl(ticket, new_sl):
+                            info["be_applied"] = True
+                            log.info(f"[PositionManager] BREAKEVEN | Ticket {ticket} | New SL: {new_sl:.5f} | Vol Confirmed: {VOLUME_CONFIRMATION_ENABLED}")
+                else:  # SELL
+                    new_sl = entry - be_buffer
+                    if current_sl > new_sl or current_sl == 0:
+                        if modify_position_sl(ticket, new_sl):
+                            info["be_applied"] = True
+                            log.info(f"[PositionManager] BREAKEVEN | Ticket {ticket} | New SL: {new_sl:.5f} | Vol Confirmed: {VOLUME_CONFIRMATION_ENABLED}")
 
         # -- TRAILING STOP: Trail SL behind price after 1.5R --
         if info["be_applied"] and profit_in_r >= TRAIL_TRIGGER_RR:
