@@ -118,6 +118,64 @@ def is_near_poi(current_price: float, smc_data: dict, base_symbol: str) -> bool:
 # ──────────────────────────────────────────────
 #  MAIN LOOP
 # ──────────────────────────────────────────────
+#  PURE ALGORITHMIC DECISION ENGINE
+# ──────────────────────────────────────────────
+def run_algorithmic_decision(
+    symbol: str, current_price: float, df_m5, smc_data: dict, atr_m15_raw, htf_trend: dict
+) -> dict:
+    """
+    100% Algorithmic mathematical logic, completely replacing Claude AI.
+    Searches for valid M15 FVGs aligned with H4 trend, confirmed by M5 momentum.
+    """
+    decision = {"action": "HOLD", "reason": "No valid algorithmic setup", "confidence": 0}
+    trend_dir = htf_trend.get("direction", "NEUTRAL")
+    fvgs = smc_data.get("fvgs", [])
+    
+    # Handle pandas series vs float
+    atr = atr_m15_raw.iloc[-1] if hasattr(atr_m15_raw, "iloc") else atr_m15_raw
+
+    # A) Bullish overlap
+    for fvg in fvgs:
+        if fvg["type"] == "Bullish" and trend_dir in ["BULLISH", "NEUTRAL"]:
+            if fvg["low"] <= current_price <= fvg["high"]:
+                last_m5_close = df_m5["close"].iloc[-2]
+                last_m5_open  = df_m5["open"].iloc[-2]
+                if last_m5_close > last_m5_open:  # M5 bullish confirmation
+                    sl = fvg["low"] - (atr * 0.5)
+                    tp = current_price + ((current_price - sl) * 2.0)
+                    return {
+                        "action": "BUY",
+                        "reason": "SETUP: Price in Bullish M15 FVG | TRIGGER: M5 Bullish Close | TARGET: 1:2 Algorithmic RR",
+                        "confidence": 90,
+                        "entry": current_price,
+                        "sl": sl, "tp": tp, "rr_ratio": 2.0,
+                        "key_level": f"M15 Bullish FVG {fvg['low']:.5f}",
+                        "confluences": ["M15 FVG", "M5 Bullish Close"]
+                    }
+                    
+    # B) Bearish overlap
+    for fvg in fvgs:
+        if fvg["type"] == "Bearish" and trend_dir in ["BEARISH", "NEUTRAL"]:
+            if fvg["low"] <= current_price <= fvg["high"]:
+                last_m5_close = df_m5["close"].iloc[-2]
+                last_m5_open  = df_m5["open"].iloc[-2]
+                if last_m5_close < last_m5_open:  # M5 bearish confirmation
+                    sl = fvg["high"] + (atr * 0.5)
+                    tp = current_price - ((sl - current_price) * 2.0)
+                    return {
+                        "action": "SELL",
+                        "reason": "SETUP: Price in Bearish M15 FVG | TRIGGER: M5 Bearish Close | TARGET: 1:2 Algorithmic RR",
+                        "confidence": 90,
+                        "entry": current_price,
+                        "sl": sl, "tp": tp, "rr_ratio": 2.0,
+                        "key_level": f"M15 Bearish FVG {fvg['high']:.5f}",
+                        "confluences": ["M15 FVG", "M5 Bearish Close"]
+                    }
+                    
+    return decision
+
+
+# ──────────────────────────────────────────────
 def main():
     log.info("=" * 60)
     log.info("  SMC + Price Action AI Trading Bot v2.0 (INTRADAY/SCALPING)")
@@ -304,21 +362,14 @@ def main():
                 # ── Get recent performance for AI context ──
                 perf = trade_log.get_recent_performance(symbol)
 
-                # ── Call Claude AI ──
-                decision = analyse_with_claude(
+                # ── PURE ALGORITHMIC ENGINE ──
+                decision = run_algorithmic_decision(
                     symbol=symbol,
                     current_price=current_price,
                     df_m5=df_m5,
-                    df_h1=df_h1,
                     smc_data=smc_data,
-                    patterns=patterns,
-                    sr_data=sr_data,
-                    liquidity_text=liquidity_text,
-                    htf_trend=htf_trend,
-                    volume_info=volume_info,
-                    atr_m15=atr_m15,
-                    atr_h1=atr_h1,
-                    recent_performance=perf
+                    atr_m15_raw=atr_m15,
+                    htf_trend=htf_trend
                 )
 
                 # ── Log the signal ──
