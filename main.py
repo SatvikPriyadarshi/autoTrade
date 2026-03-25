@@ -36,7 +36,7 @@ from core.connection_monitor import connection_monitor
 from core.error_handler import check_mt5_connection
 
 # ── Analysis ──
-from analysis.smc import detect_order_blocks, detect_fvg, detect_bos_choch
+from analysis.smc import detect_order_blocks, detect_fvg, detect_bos_choch, get_recent_swings
 from analysis.patterns import detect_chart_patterns, confirm_m5_entry
 from analysis.support_resistance import detect_support_resistance, format_sr_for_prompt
 from analysis.liquidity import detect_liquidity_sweeps, detect_equal_highs_lows, format_liquidity_for_prompt
@@ -128,147 +128,111 @@ def run_algorithmic_decision(
     decision = {"action": "HOLD", "reason": "No valid algorithmic setup", "confidence": 50}
     trend_dir = htf_trend.get("direction", "NEUTRAL")
     fvgs = smc_data.get("fvgs", [])
-    vol_ratio = volume_info.get("vol_ratio", 1.0)
+    obs = smc_data.get("order_blocks", [])
+    vol_ratio = float(volume_info.get("vol_ratio", 1.0))
+    atr = float(atr_m15_raw.iloc[-1] if hasattr(atr_m15_raw, "iloc") else atr_m15_raw)
     
-    def calculate_dynamic_tp(action_dir: str, current: float, sl_price: float) -> tuple[float, float]:
-        """Calculates dynamic RR between 2.0 and 4.0 using H1 Support/Resistance."""
-        risk_dist = abs(float(current) - float(sl_price))
-        if risk_dist <= 0: return float(current), 2.0
-        
+    # Get structural swings for logical SL/TP
+    swings = get_recent_swings(df_h1, lookback=50)
+    swing_high = float(swings["high"])
+    swing_low  = float(swings["low"])
+
+    def calculate_logical_tp_sl(action_dir: str, current: float) -> tuple[float, float, float]:
+        """Calculates SL at swing and searches for TP that gives >= 2.0 RR."""
         if action_dir == "BUY":
+            # SL at swing low with minor buffer
+            sl_price = swing_low - (atr * 0.2)
+            risk = abs(float(current) - sl_price)
+            if risk <= 0.00001: risk = atr * 0.5; sl_price = current - risk
+            
+            # Search for TP at H1 Resistance levels
             res_levels = sr_data.get("resistance", [])
             valid_res = sorted([float(r) for r in res_levels if float(r) > float(current)])
+            
             for r in valid_res:
-                rr = float((r - float(current)) / risk_dist)
-                if 2.0 <= rr <= 4.0:
-                    return r, float(f"{rr:.2f}")
-                elif rr > 4.0:
-                    return float(current) + (risk_dist * 4.0), 4.0
-            return float(current) + (risk_dist * 2.0), 2.0
+                rr_val = float((r - float(current)) / risk)
+                if rr_val >= 2.0:
+                    return sl_price, r, round(rr_val, 2)
+            
+            # Fallback to last swing high if it offers better RR
+            if (swing_high - current) / risk >= 2.0:
+                return sl_price, swing_high, round((swing_high - current) / risk, 2)
+                
+            # Final fallback: math-based 2.0R
+            return sl_price, current + (risk * 2.0), 2.0
         else:
+            # SL at swing high with minor buffer
+            sl_price = swing_high + (atr * 0.2)
+            risk = abs(sl_price - float(current))
+            if risk <= 0.00001: risk = atr * 0.5; sl_price = current + risk
+            
+            # Search for TP at H1 Support levels
             sup_levels = sr_data.get("support", [])
             valid_sup = sorted([float(s) for s in sup_levels if float(s) < float(current)], reverse=True)
+            
             for s in valid_sup:
-                rr = float((float(current) - s) / risk_dist)
-                if 2.0 <= rr <= 4.0:
-                    return s, float(f"{rr:.2f}")
-                elif rr > 4.0:
-                    return float(current) - (risk_dist * 4.0), 4.0
-            return float(current) - (risk_dist * 2.0), 2.0
+                rr_val = float((float(current) - s) / risk)
+                if rr_val >= 2.0:
+                    return sl_price, s, round(rr_val, 2)
+            
+            # Fallback to last swing low
+            if (current - swing_low) / risk >= 2.0:
+                return sl_price, swing_low, round((current - swing_low) / risk, 2)
+                
+            return sl_price, current - (risk * 2.0), 2.0
 
-    
     # Check H1 Alignment
-    h1_ema20 = df_h1["close"].ewm(span=20, adjust=False).mean().iloc[-1]
-    h1_ema50 = df_h1["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+    h1_ema20 = float(df_h1["close"].ewm(span=20, adjust=False).mean().iloc[-1])
+    h1_ema50 = float(df_h1["close"].ewm(span=50, adjust=False).mean().iloc[-1])
     h1_bullish = h1_ema20 > h1_ema50
     h1_bearish = h1_ema20 < h1_ema50
 
-    atr = atr_m15_raw.iloc[-1] if hasattr(atr_m15_raw, "iloc") else atr_m15_raw
-
-    # Filter out dead volume markets
-    if vol_ratio < 0.7:
-        decision["reason"] = f"Volume too low ({vol_ratio}x avg)"
+    if vol_ratio < 0.6:
+        decision["reason"] = f"Volume too low ({vol_ratio:.1f}x avg)"
         return decision
 
-    # ──────────────────────────────────────────────
-    #  M5 CANDLESTICK MATH (Run regardless of FVG)
-    # ──────────────────────────────────────────────
-    c_close = df_m5["close"].iloc[-2]
-    c_open = df_m5["open"].iloc[-2]
-    c_high = df_m5["high"].iloc[-2]
-    c_low = df_m5["low"].iloc[-2]
-    c_body = abs(c_close - c_open)
-    c_range = c_high - c_low if (c_high - c_low) > 0 else 0.00001
+    # PA Triggers
+    c_close = float(df_m5["close"].iloc[-2]); c_open = float(df_m5["open"].iloc[-2])
+    c_high = float(df_m5["high"].iloc[-2]); c_low = float(df_m5["low"].iloc[-2])
+    c_body = abs(c_close - c_open); c_range = max(c_high - c_low, 0.00001)
     
-    c_open_close_min = min(c_open, c_close)
-    c_open_close_max = max(c_open, c_close)
+    is_bullish_pa = ((min(c_open, c_close) - c_low > c_body * 1.8) or (c_close > c_open and c_body/c_range > 0.45))
+    is_bearish_pa = ((c_high - max(c_open, c_close) > c_body * 1.8) or (c_close < c_open and c_body/c_range > 0.45))
 
-    is_strong_bullish_momentum = (c_close > c_open) and (c_body / c_range > 0.5) and (c_close > c_high - (c_range * 0.3))
-    is_strong_bearish_momentum = (c_close < c_open) and (c_body / c_range > 0.5) and (c_close < c_low + (c_range * 0.3))
+    # Zones
+    in_bullish_poi = any(float(f["low"]) <= current_price <= float(f["high"]) for f in fvgs if f["type"] == "Bullish") or \
+                     any(float(o["low"]) <= current_price <= float(o["high"]) for o in obs if o["type"] == "Bullish") or \
+                     any(abs(current_price - float(s)) < (atr * 0.3) for s in sr_data.get("support", []))
 
-    # M5 Hammer / Pinbar
-    is_bullish_hammer = (c_open_close_min - c_low > c_body * 2.0) and (c_high - c_open_close_max < c_range * 0.2) and (c_range > 0.00001)
-    is_bearish_hammer = (c_high - c_open_close_max > c_body * 2.0) and (c_open_close_min - c_low < c_range * 0.2) and (c_range > 0.00001)
+    in_bearish_poi = any(float(f["low"]) <= current_price <= float(f["high"]) for f in fvgs if f["type"] == "Bearish") or \
+                     any(float(o["low"]) <= current_price <= float(o["high"]) for o in obs if o["type"] == "Bearish") or \
+                     any(abs(current_price - float(r)) < (atr * 0.3) for r in sr_data.get("resistance", []))
 
-    # M5 Liquidity Sweep (Swept lowest low / highest high of the previous 10 candles)
-    recent_lows = df_m5["low"].iloc[-12:-2].min()
-    recent_highs = df_m5["high"].iloc[-12:-2].max()
-    is_bullish_sweep = (c_low < recent_lows) and (c_close > recent_lows)
-    is_bearish_sweep = (c_high > recent_highs) and (c_close < recent_highs)
-
-    valid_bullish_trigger = is_strong_bullish_momentum or is_bullish_hammer or is_bullish_sweep
-    valid_bearish_trigger = is_strong_bearish_momentum or is_bearish_hammer or is_bearish_sweep
-
-
-    # Check for active price inside any FVG first
-    active_fvg_type = None
-    level = 0.0
-    for fvg in fvgs:
-        if fvg["low"] <= current_price <= fvg["high"]:
-            active_fvg_type = fvg["type"]
-            level = fvg["low"] if fvg["type"] == "Bullish" else fvg["high"]
-            break
-
-    if active_fvg_type:
-        # We are inside a zone! Let's mathematically verify it step-by-step for the Dashboard.
-        if vol_ratio < 0.7:
-            decision["reason"] = f"REJECT {active_fvg_type} FVG: Trading Volume extremely low ({vol_ratio}x)"
-            return decision
-
-        if active_fvg_type == "Bullish":
-            if trend_dir == "BEARISH" or not h1_bullish:
-                decision["reason"] = f"REJECT {active_fvg_type} FVG: H4/H1 trend is not Bullish"
-                return decision
-            if not valid_bullish_trigger:
-                decision["reason"] = f"WAIT IN {active_fvg_type} FVG: M5 lacks momentum/pinbar/sweep"
-                return decision
+    # Execution
+    if in_bullish_poi and h1_bullish and trend_dir != "BEARISH":
+        if is_bullish_pa:
+            sl, tp, rr = calculate_logical_tp_sl("BUY", current_price)
+            if rr < 2.0: return decision # Safety
+            return {
+                "action": "BUY", "reason": f"SETUP: Structural POI | TRIGGER: M5 PA | TARGET: 1:{rr} R:R",
+                "confidence": 92, "entry": current_price, "sl": sl, "tp": tp, "rr_ratio": rr,
+                "key_level": "Structural POI", "confluences": ["POI", "M5 PA", "Logical R:R"]
+            }
         else:
-            if trend_dir == "BULLISH" or not h1_bearish:
-                decision["reason"] = f"REJECT {active_fvg_type} FVG: H4/H1 trend is not Bearish"
-                return decision
-            if not valid_bearish_trigger:
-                decision["reason"] = f"WAIT IN {active_fvg_type} FVG: M5 lacks momentum/pinbar/sweep"
-                return decision
-    # A) Executable Bullish FVG setup
-    for fvg in fvgs:
-        if fvg["type"] == "Bullish" and trend_dir in ["BULLISH", "NEUTRAL"] and h1_bullish:
-            if fvg["low"] <= current_price <= fvg["high"]:
-                if valid_bullish_trigger:
-                    sl = fvg["low"] - (atr * 0.5)
-                    tp, rr = calculate_dynamic_tp("BUY", current_price, sl)
-                    
-                    trigger_reason = "Liquidity Sweep" if is_bullish_sweep else "Bullish Hammer" if is_bullish_hammer else "Strong Bullish Momentum"
-                    
-                    return {
-                        "action": "BUY",
-                        "reason": f"SETUP: Price in M15 FVG | TRIGGER: M5 {trigger_reason} | TARGET: 1:{rr} R:R",
-                        "confidence": 92,
-                        "entry": current_price,
-                        "sl": sl, "tp": tp, "rr_ratio": rr,
-                        "key_level": f"M15 Bullish FVG {fvg['low']:.5f}",
-                        "confluences": ["M15 FVG", f"M5 {trigger_reason}", "H4+H1 Trend Validation", f"Target 1:{rr}R"]
-                    }
-                    
-    # B) Executable Bearish FVG setup
-    for fvg in fvgs:
-        if fvg["type"] == "Bearish" and trend_dir in ["BEARISH", "NEUTRAL"] and h1_bearish:
-            if fvg["low"] <= current_price <= fvg["high"]:
-                if valid_bearish_trigger:
-                    sl = fvg["high"] + (atr * 0.5)
-                    tp, rr = calculate_dynamic_tp("SELL", current_price, sl)
-                    
-                    trigger_reason = "Liquidity Sweep" if is_bearish_sweep else "Bearish Pinbar" if is_bearish_hammer else "Strong Bearish Momentum"
-                    
-                    return {
-                        "action": "SELL",
-                        "reason": f"SETUP: Price in M15 FVG | TRIGGER: M5 {trigger_reason} | TARGET: 1:{rr} R:R",
-                        "confidence": 92,
-                        "entry": current_price,
-                        "sl": sl, "tp": tp, "rr_ratio": rr,
-                        "key_level": f"M15 Bearish FVG {fvg['high']:.5f}",
-                        "confluences": ["M15 FVG", f"M5 {trigger_reason}", "H4+H1 Trend Validation", f"Target 1:{rr}R"]
-                    }
-                    
+            decision["reason"] = "WAIT: Inside Bullish POI, waiting for M5 Candle trigger"
+
+    elif in_bearish_poi and h1_bearish and trend_dir != "BULLISH":
+        if is_bearish_pa:
+            sl, tp, rr = calculate_logical_tp_sl("SELL", current_price)
+            if rr < 2.0: return decision # Safety
+            return {
+                "action": "SELL", "reason": f"SETUP: Structural POI | TRIGGER: M5 PA | TARGET: 1:{rr} R:R",
+                "confidence": 92, "entry": current_price, "sl": sl, "tp": tp, "rr_ratio": rr,
+                "key_level": "Structural POI", "confluences": ["POI", "M5 PA", "Logical R:R"]
+            }
+        else:
+            decision["reason"] = "WAIT: Inside Bearish POI, waiting for M5 Candle trigger"
+
     return decision
 
 

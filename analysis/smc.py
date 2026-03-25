@@ -68,12 +68,14 @@ def detect_order_blocks(df: pd.DataFrame, lookback: int = 50) -> List[Dict]:
         subsequent = df.iloc[start:]
 
         if ob["type"] == "Bullish":
-            # Bullish OB mitigated if price broke below its low
-            if len(subsequent) > 0 and subsequent["low"].min() < ob["low"]:
+            # Bullish OB mitigated only if price clearly breaks below its low
+            low_val = float(ob["low"])
+            if len(subsequent) > 0 and subsequent["low"].min() < (low_val - (low_val * 0.0001)):
                 ob["mitigated"] = True
         elif ob["type"] == "Bearish":
-            # Bearish OB mitigated if price broke above its high
-            if len(subsequent) > 0 and subsequent["high"].max() > ob["high"]:
+            # Bearish OB mitigated only if price clearly breaks above its high
+            high_val = float(ob["high"])
+            if len(subsequent) > 0 and subsequent["high"].max() > (high_val + (high_val * 0.0001)):
                 ob["mitigated"] = True
 
     active = [ob for ob in obs if not ob["mitigated"]]
@@ -135,18 +137,22 @@ def detect_fvg(
 
     # ── Check fill status using subsequent candle wicks ──
     for fvg in fvgs:
-        start_idx = fvg["candle_idx"] + 2  # Check candles after the FVG formed
+        idx = int(fvg.get("candle_idx", 0))
+        start_idx = idx + 2  # Check candles after the FVG formed
         if start_idx >= len(df):
             continue
         subsequent = df.iloc[start_idx:]
 
         if fvg["type"] == "Bullish":
-            # Bullish FVG filled if any subsequent candle's LOW dipped into the gap
-            if len(subsequent) > 0 and subsequent["low"].min() <= fvg["low"]:
+            # Bullish FVG filled only if price breaks COMPLETELY through the bottom
+            # (Allows price to sit inside the gap for entry triggers)
+            low_val = float(fvg["low"])
+            if len(subsequent) > 0 and subsequent["low"].min() < (low_val - (low_val * 0.00005)):
                 fvg["filled"] = True
         elif fvg["type"] == "Bearish":
-            # Bearish FVG filled if any subsequent candle's HIGH rose into the gap
-            if len(subsequent) > 0 and subsequent["high"].max() >= fvg["high"]:
+            # Bearish FVG filled only if price rose COMPLETELY through the top
+            high_val = float(fvg["high"])
+            if len(subsequent) > 0 and subsequent["high"].max() > (high_val + (high_val * 0.00005)):
                 fvg["filled"] = True
 
     # Clean up internal field and return only open FVGs
@@ -221,3 +227,31 @@ def get_structure_bias(structure_text: str) -> str:
     if "BEARISH" in text or "DOWNTREND" in text or "LOWER" in text:
         return "BEARISH"
     return "NEUTRAL"
+
+
+def get_recent_swings(df: pd.DataFrame, lookback: int = 40) -> Dict[str, float]:
+    """
+    Finds the absolute most recent structural Swing High and Swing Low.
+    Used for logical SL/TP placement.
+    """
+    df = df.tail(lookback).reset_index(drop=True)
+    highs = [float(h) for h in df["high"].tolist()]
+    lows  = [float(l) for l in df["low"].tolist()]
+    n = len(highs)
+    
+    if n < 5:
+        return {"high": float(df["high"].max()), "low": float(df["low"].min())}
+        
+    last_high = highs[0]
+    last_low = lows[0]
+    
+    # Peak/Trough detection
+    for i in range(2, n - 2):
+        # Swing High
+        if highs[i] > highs[i-1] and highs[i] > highs[i+1] and highs[i] > highs[i-2] and highs[i] > highs[i+2]:
+            last_high = highs[i]
+        # Swing Low
+        if lows[i] < lows[i-1] and lows[i] < lows[i+1] and lows[i] < lows[i-2] and lows[i] < lows[i+2]:
+            last_low = lows[i]
+            
+    return {"high": float(last_high), "low": float(last_low)}

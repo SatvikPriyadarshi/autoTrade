@@ -66,11 +66,11 @@ PIP_VALUE = {
 # ──────────────────────────────────────────────
 #  RISK PARAMETERS
 # ──────────────────────────────────────────────
-RISK_PCT                      = 1.0
+RISK_PCT                      = 2.0  # Increased to aim for $20 risk on $1000 accounts
 MAX_DAILY_LOSS_USD            = float(os.getenv("MAX_DAILY_LOSS_USD", "100"))
 MAX_DAILY_LOSS_PCT            = 3.0
-MAX_RISK_PER_TRADE_USD        = float(os.getenv("MAX_RISK_PER_TRADE_USD", "20"))
-MAX_TRADE_LOSS_USD            = float(os.getenv("MAX_TRADE_LOSS_USD", "50"))  # Absolute max loss per trade (hard stop)
+MAX_RISK_PER_TRADE_USD        = 20.0  # Physical cap at exactly $20
+MAX_TRADE_LOSS_USD            = 20.0  # Hard stop at $20 as well
 MAX_TRADES_DAY                = 10
 MAX_TRADES_PER_SYMBOL_PER_DAY = int(os.getenv("MAX_TRADES_PER_SYMBOL_PER_DAY", "3"))
 SYMBOL_COOLDOWN_MIN           = int(os.getenv("SYMBOL_COOLDOWN_MIN", "10"))
