@@ -84,6 +84,26 @@ def detect_order_blocks(df: pd.DataFrame, lookback: int = 50) -> List[Dict]:
 
 
 # ──────────────────────────────────────────────
+#  BREAKER BLOCKS
+# ──────────────────────────────────────────────
+def detect_breaker_blocks(df: pd.DataFrame, lookback: int = 50) -> List[Dict]:
+    """
+    Detect Breaker Blocks (a failed OB that price returned to).
+    A Bullish Breaker = Price broke below a bearish OB and then reclaimed it as support.
+    """
+    # Simply detecting recently mitigated OBs where price returned to the 'high' side
+    df = df.tail(lookback).reset_index(drop=True)
+    current_price = float(df["close"].iloc[-1])
+    breakers = []
+    
+    # Logic: Look for OBs that were 'Broken' then 'Reclaimed'
+    # Simplified: Any OB that was mitigated in the last 10 candles but price has now crossed back inside
+    # (High quality SMC concept)
+    return breakers # Placeholder for now, will implement logic in next pass if needed, or stick to OB/FVG
+
+
+
+# ──────────────────────────────────────────────
 #  FAIR VALUE GAPS (with min-size filter + proper fill tracking)
 # ──────────────────────────────────────────────
 def detect_fvg(
@@ -212,11 +232,23 @@ def detect_bos_choch(df: pd.DataFrame, lookback: int = 50) -> str:
         return "Lower Highs + Lower Lows (Downtrend)"
 
     if last_hh < prev_hh and last_ll > prev_ll:
-        return "CHOCH — possible bullish reversal forming"
+        return "CHOCH Bullish Reversal — possible uptrend"
     if last_hh > prev_hh and last_ll < prev_ll:
-        return "CHOCH — possible bearish reversal forming"
+        return "CHOCH Bearish Reversal — possible downtrend"
 
-    return "Ranging / No clear structure"
+    return "Ranging"
+
+
+def get_market_bias(df: pd.DataFrame) -> Dict[str, str]:
+    """Advanced Market Bias combining BOS and CHOCH."""
+    structure = detect_bos_choch(df)
+    bias = "NEUTRAL"
+    if "BOS BULLISH" in structure.upper() or "UPTREND" in structure.upper() or "CHOCH BULLISH" in structure.upper():
+        bias = "BULLISH"
+    elif "BOS BEARISH" in structure.upper() or "DOWNTREND" in structure.upper() or "CHOCH BEARISH" in structure.upper():
+        bias = "BEARISH"
+    return {"bias": bias, "structure": structure}
+
 
 
 def get_structure_bias(structure_text: str) -> str:
@@ -255,3 +287,16 @@ def get_recent_swings(df: pd.DataFrame, lookback: int = 40) -> Dict[str, float]:
             last_low = lows[i]
             
     return {"high": float(last_high), "low": float(last_low)}
+
+
+def get_p_d_zones(current_price: float, swing_high: float, swing_low: float) -> str:
+    """Classify if price is in Premium, Discount, or Equilibrium zone."""
+    rng = swing_high - swing_low
+    if rng <= 0: return "EQUILIBRIUM"
+    
+    eq = swing_low + (rng * 0.5)
+    if current_price > (swing_low + (rng * 0.55)):
+        return "PREMIUM"
+    if current_price < (swing_low + (rng * 0.45)):
+        return "DISCOUNT"
+    return "EQUILIBRIUM"

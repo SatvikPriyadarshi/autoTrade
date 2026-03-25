@@ -36,7 +36,10 @@ from core.connection_monitor import connection_monitor
 from core.error_handler import check_mt5_connection
 
 # ── Analysis ──
-from analysis.smc import detect_order_blocks, detect_fvg, detect_bos_choch, get_recent_swings
+from analysis.smc import (
+    detect_order_blocks, detect_fvg, detect_bos_choch, 
+    get_recent_swings, get_market_bias, get_p_d_zones
+)
 from analysis.patterns import detect_chart_patterns, confirm_m5_entry
 from analysis.support_resistance import detect_support_resistance, format_sr_for_prompt
 from analysis.liquidity import detect_liquidity_sweeps, detect_equal_highs_lows, format_liquidity_for_prompt
@@ -127,10 +130,13 @@ def run_algorithmic_decision(
     """
     decision = {"action": "HOLD", "reason": "No valid algorithmic setup", "confidence": 50}
     trend_dir = htf_trend.get("direction", "NEUTRAL")
+    market_bias = smc_data.get("bias", "NEUTRAL")
+    structure_text = smc_data.get("bos_choch", "")
     fvgs = smc_data.get("fvgs", [])
     obs = smc_data.get("order_blocks", [])
     vol_ratio = float(volume_info.get("vol_ratio", 1.0))
     atr = float(atr_m15_raw.iloc[-1] if hasattr(atr_m15_raw, "iloc") else atr_m15_raw)
+
     
     # Get structural swings for logical SL/TP
     swings = get_recent_swings(df_h1, lookback=50)
@@ -152,11 +158,12 @@ def run_algorithmic_decision(
             for r in valid_res:
                 rr_val = float((r - float(current)) / risk)
                 if rr_val >= 2.0:
-                    return sl_price, r, round(rr_val, 2)
+                    return sl_price, r, round(float(rr_val), 2)
             
             # Fallback to last swing high if it offers better RR
             if (swing_high - current) / risk >= 2.0:
-                return sl_price, swing_high, round((swing_high - current) / risk, 2)
+                rr_f = float((swing_high - current) / risk)
+                return sl_price, swing_high, round(rr_f, 2)
                 
             # Final fallback: math-based 2.0R
             return sl_price, current + (risk * 2.0), 2.0
@@ -173,11 +180,12 @@ def run_algorithmic_decision(
             for s in valid_sup:
                 rr_val = float((float(current) - s) / risk)
                 if rr_val >= 2.0:
-                    return sl_price, s, round(rr_val, 2)
+                    return sl_price, s, round(float(rr_val), 2)
             
             # Fallback to last swing low
             if (current - swing_low) / risk >= 2.0:
-                return sl_price, swing_low, round((current - swing_low) / risk, 2)
+                rr_f = float((current - swing_low) / risk)
+                return sl_price, swing_low, round(rr_f, 2)
                 
             return sl_price, current - (risk * 2.0), 2.0
 
@@ -208,30 +216,49 @@ def run_algorithmic_decision(
                      any(float(o["low"]) <= current_price <= float(o["high"]) for o in obs if o["type"] == "Bearish") or \
                      any(abs(current_price - float(r)) < (atr * 0.3) for r in sr_data.get("resistance", []))
 
+    # 5. Premium/Discount Filter
+    pd_zone = get_p_d_zones(current_price, swing_high, swing_low)
+
     # Execution
     if in_bullish_poi and h1_bullish and trend_dir != "BEARISH":
-        if is_bullish_pa:
-            sl, tp, rr = calculate_logical_tp_sl("BUY", current_price)
-            if rr < 2.0: return decision # Safety
-            return {
-                "action": "BUY", "reason": f"SETUP: Structural POI | TRIGGER: M5 PA | TARGET: 1:{rr} R:R",
-                "confidence": 92, "entry": current_price, "sl": sl, "tp": tp, "rr_ratio": rr,
-                "key_level": "Structural POI", "confluences": ["POI", "M5 PA", "Logical R:R"]
-            }
+        struct_ok = (market_bias == "BULLISH") or ("CHOCH Bullish" in structure_text)
+        if struct_ok:
+            if pd_zone in ["DISCOUNT", "EQUILIBRIUM"]:
+                if is_bullish_pa:
+                    sl, tp, rr = calculate_logical_tp_sl("BUY", current_price)
+                    if rr >= 2.0:
+                        return {
+                            "action": "BUY", "reason": f"SMC {structure_text} | {pd_zone} | POI | M5 PA | RR 1:{rr}",
+                            "confidence": 95 if "CHOCH" in structure_text else 90,
+                            "entry": current_price, "sl": sl, "tp": tp, "rr_ratio": float(rr),
+                            "key_level": "Structural POI", "confluences": [structure_text, pd_zone, "POI", "M5 PA"]
+                        }
+                else:
+                    decision["reason"] = f"WAIT: {pd_zone} + Structural OK, waiting for M5 trigger"
+            else:
+                decision["reason"] = f"WAIT: Bullish POI but price is in {pd_zone} (Expensive)"
         else:
-            decision["reason"] = "WAIT: Inside Bullish POI, waiting for M5 Candle trigger"
+            decision["reason"] = f"WAIT: Price in POI but H1 Structure is {structure_text}"
 
     elif in_bearish_poi and h1_bearish and trend_dir != "BULLISH":
-        if is_bearish_pa:
-            sl, tp, rr = calculate_logical_tp_sl("SELL", current_price)
-            if rr < 2.0: return decision # Safety
-            return {
-                "action": "SELL", "reason": f"SETUP: Structural POI | TRIGGER: M5 PA | TARGET: 1:{rr} R:R",
-                "confidence": 92, "entry": current_price, "sl": sl, "tp": tp, "rr_ratio": rr,
-                "key_level": "Structural POI", "confluences": ["POI", "M5 PA", "Logical R:R"]
-            }
+        struct_ok = (market_bias == "BEARISH") or ("CHOCH Bearish" in structure_text)
+        if struct_ok:
+            if pd_zone in ["PREMIUM", "EQUILIBRIUM"]:
+                if is_bearish_pa:
+                    sl, tp, rr = calculate_logical_tp_sl("SELL", current_price)
+                    if rr >= 2.0:
+                        return {
+                            "action": "SELL", "reason": f"SMC {structure_text} | {pd_zone} | POI | M5 PA | RR 1:{rr}",
+                            "confidence": 95 if "CHOCH" in structure_text else 90,
+                            "entry": current_price, "sl": sl, "tp": tp, "rr_ratio": float(rr),
+                            "key_level": "Structural POI", "confluences": [structure_text, pd_zone, "POI", "M5 PA"]
+                        }
+                else:
+                    decision["reason"] = f"WAIT: {pd_zone} + Structural OK, waiting for M5 trigger"
+            else:
+                decision["reason"] = f"WAIT: Bearish POI but price is in {pd_zone} (Cheap)"
         else:
-            decision["reason"] = "WAIT: Inside Bearish POI, waiting for M5 Candle trigger"
+            decision["reason"] = f"WAIT: Price in POI but H1 Structure is {structure_text}"
 
     return decision
 
@@ -387,10 +414,13 @@ def main():
 
                 # ── Run all analyses ──
                 # SMC
+                # SMC Analysis (H1 Structural Bias + M15 POIs)
+                smc_h1 = get_market_bias(df_h1)
                 smc_data = {
                     "order_blocks": detect_order_blocks(df_h1),
                     "fvgs":         detect_fvg(df_m15, base_symbol=base_symbol),
-                    "bos_choch":    detect_bos_choch(df_h1),
+                    "bos_choch":    smc_h1["structure"],
+                    "bias":         smc_h1["bias"]
                 }
 
                 # Patterns
