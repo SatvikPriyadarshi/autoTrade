@@ -22,6 +22,9 @@ from config.settings import (
     SYMBOL_SESSIONS, GMT, BOT_MAGIC, log,
     LONDON_START, LONDON_END, NY_START, NY_END,
     INTRADAY_MODE,
+    ALGO_VOLUME_MIN_RATIO, ALGO_POI_ATR_MULT, ALGO_POI_EXTRA_PIPS,
+    ALGO_REQUIRE_M5_CONFIRM, ALGO_REQUIRE_MTF_CONFIRM, ALGO_MTF_MIN_CONFIDENCE,
+    ALGO_MIN_POI_CONFLUENCE, ALGO_LIQUIDITY_SHORTCUT, ALGO_REQUIRE_M15_EMA_ALIGN,
 )
 
 # ── Core ──
@@ -37,8 +40,13 @@ from core.error_handler import check_mt5_connection
 
 # ── Analysis ──
 from analysis.smc import (
-    detect_order_blocks, detect_fvg, detect_bos_choch, 
-    get_recent_swings, get_market_bias, get_p_d_zones
+    detect_order_blocks,
+    detect_fvg,
+    detect_breaker_retests,
+    detect_ict_breaker_blocks,
+    get_recent_swings,
+    get_enriched_market_structure,
+    get_p_d_zones,
 )
 from analysis.patterns import detect_chart_patterns, confirm_m5_entry
 from analysis.support_resistance import detect_support_resistance, format_sr_for_prompt
@@ -99,20 +107,34 @@ def is_symbol_in_optimal_session(base_symbol: str) -> bool:
 # ──────────────────────────────────────────────
 #  POINT-OF-INTEREST PROXIMITY CHECK
 # ──────────────────────────────────────────────
-def is_near_poi(current_price: float, smc_data: dict, base_symbol: str) -> bool:
-    """Check if price is near an order block, FVG, or has active patterns."""
+def is_near_poi(
+    current_price: float,
+    smc_data: dict,
+    base_symbol: str,
+    atr=None,
+) -> bool:
+    """True if price is near an OB, FVG, breaker retest, or breaker zone (wider buffer when ATR given)."""
     pip = PIP_VALUE.get(base_symbol, 0.0001)
-    buffer = POI_BUFFER_PIPS.get(base_symbol, 5) * pip
+    buffer = POI_BUFFER_PIPS.get(base_symbol, 5) * pip + ALGO_POI_EXTRA_PIPS * pip
+    if atr is not None and atr > 0:
+        buffer = max(buffer, float(atr) * ALGO_POI_ATR_MULT)
 
-    near_ob = any(
-        (ob["low"] - buffer) <= current_price <= (ob["high"] + buffer)
-        for ob in smc_data.get("order_blocks", [])
-    )
-    near_fvg = any(
-        (fvg["low"] - buffer) <= current_price <= (fvg["high"] + buffer)
-        for fvg in smc_data.get("fvgs", [])
-    )
-    return near_ob or near_fvg
+    def near_zone(lo, hi) -> bool:
+        return (float(lo) - buffer) <= current_price <= (float(hi) + buffer)
+
+    for ob in smc_data.get("order_blocks", []):
+        if near_zone(ob["low"], ob["high"]):
+            return True
+    for fvg in smc_data.get("fvgs", []):
+        if near_zone(fvg["low"], fvg["high"]):
+            return True
+    for br in smc_data.get("breaker_retests", []):
+        if near_zone(br["low"], br["high"]):
+            return True
+    for ict in smc_data.get("ict_breakers", []):
+        if near_zone(ict["low"], ict["high"]):
+            return True
+    return False
 
 
 # ──────────────────────────────────────────────
@@ -121,28 +143,65 @@ def is_near_poi(current_price: float, smc_data: dict, base_symbol: str) -> bool:
 #  PURE ALGORITHMIC DECISION ENGINE
 # ──────────────────────────────────────────────
 def run_algorithmic_decision(
-    symbol: str, current_price: float, df_m5, smc_data: dict, atr_m15_raw, 
-    htf_trend: dict, volume_info: dict, df_h1, sr_data: dict
+    symbol: str,
+    current_price: float,
+    df_m5,
+    df_m15,
+    smc_data: dict,
+    atr_m15_raw,
+    htf_trend: dict,
+    volume_info: dict,
+    df_h1,
+    sr_data: dict,
+    sweeps: list,
+    base_symbol: str,
 ) -> dict:
     """
-    100% Algorithmic mathematical logic.
-    Searches for valid M15 FVGs aligned with H4 + H1 trend, confirmed by strong M5 momentum and volume.
+    Pure algo (no AI).
+    H1: BOS/CHOCH bias + EMA20/50 trend filter + premium/discount swings.
+    M15: POI only — FVG, order blocks, mitigated-OB retest, ICT breakers (failed swing + reclaim).
+    M5: candle confirmation; H4: execution gate via is_trade_aligned_with_trend in main.
     """
+    def to_float(val, default=0.0):
+        try:
+            if isinstance(val, dict):
+                # Handle potential nested price dicts
+                inner = val.get("price", val.get("low", val.get("high", default)))
+                if isinstance(inner, dict): return to_float(inner, default)
+                return float(inner)
+            return float(val) if val is not None else default
+        except (TypeError, ValueError):
+            return default
+
     decision = {"action": "HOLD", "reason": "No valid algorithmic setup", "confidence": 50}
     trend_dir = htf_trend.get("direction", "NEUTRAL")
     market_bias = smc_data.get("bias", "NEUTRAL")
     structure_text = smc_data.get("bos_choch", "")
+    struct_ctx = smc_data.get("structure_ctx") or {}
     fvgs = smc_data.get("fvgs", [])
     obs = smc_data.get("order_blocks", [])
-    vol_ratio = float(volume_info.get("vol_ratio", 1.0))
-    atr = float(atr_m15_raw.iloc[-1] if hasattr(atr_m15_raw, "iloc") else atr_m15_raw)
+    breakers = smc_data.get("breaker_retests", [])
+    ict_zones = smc_data.get("ict_breakers", [])
+    pip = PIP_VALUE.get(base_symbol, 0.0001)
 
+    recent_sweeps = sweeps[-3:] if sweeps else []
+    sweep_bull = any(s.get("type") == "Bullish Sweep" for s in recent_sweeps)
+    sweep_bear = any(s.get("type") == "Bearish Sweep" for s in recent_sweeps)
     
+    # Fix: volume_info uses "ratio" internally
+    vol_ratio = to_float(volume_info.get("ratio", volume_info.get("vol_ratio", 1.0)))
+    
+    current_price = to_float(current_price)
+    atr = to_float(atr_m15_raw.iloc[-1] if hasattr(atr_m15_raw, "iloc") else atr_m15_raw)
+    poi_buf = (POI_BUFFER_PIPS.get(base_symbol, 5) * pip) + (ALGO_POI_EXTRA_PIPS * pip)
+    if atr > 0:
+        poi_buf = max(poi_buf, atr * ALGO_POI_ATR_MULT)
+
     # Get structural swings for logical SL/TP
     swings = get_recent_swings(df_h1, lookback=50)
-    swing_high = float(swings["high"])
-    swing_low  = float(swings["low"])
-
+    swing_high = to_float(swings.get("high", current_price + atr*2))
+    swing_low  = to_float(swings.get("low", current_price - atr*2))
+    
     def calculate_logical_tp_sl(action_dir: str, current: float) -> tuple[float, float, float]:
         """Calculates SL at swing and searches for TP that gives >= 2.0 RR."""
         if action_dir == "BUY":
@@ -153,10 +212,10 @@ def run_algorithmic_decision(
             
             # Search for TP at H1 Resistance levels
             res_levels = sr_data.get("resistance", [])
-            valid_res = sorted([float(r) for r in res_levels if float(r) > float(current)])
+            valid_res = sorted([to_float(r) for r in res_levels if to_float(r) > current_price])
             
             for r in valid_res:
-                rr_val = float((r - float(current)) / risk)
+                rr_val = float((r - current_price) / risk)
                 if rr_val >= 2.0:
                     return sl_price, r, round(float(rr_val), 2)
             
@@ -175,10 +234,10 @@ def run_algorithmic_decision(
             
             # Search for TP at H1 Support levels
             sup_levels = sr_data.get("support", [])
-            valid_sup = sorted([float(s) for s in sup_levels if float(s) < float(current)], reverse=True)
+            valid_sup = sorted([to_float(s) for s in sup_levels if to_float(s) < current_price], reverse=True)
             
             for s in valid_sup:
-                rr_val = float((float(current) - s) / risk)
+                rr_val = float((current_price - s) / risk)
                 if rr_val >= 2.0:
                     return sl_price, s, round(float(rr_val), 2)
             
@@ -189,13 +248,22 @@ def run_algorithmic_decision(
                 
             return sl_price, current - (risk * 2.0), 2.0
 
-    # Check H1 Alignment
+    # H1 trend filter (aligned with structure timeframe)
     h1_ema20 = float(df_h1["close"].ewm(span=20, adjust=False).mean().iloc[-1])
     h1_ema50 = float(df_h1["close"].ewm(span=50, adjust=False).mean().iloc[-1])
     h1_bullish = h1_ema20 > h1_ema50
     h1_bearish = h1_ema20 < h1_ema50
 
-    if vol_ratio < 0.6:
+    # M15 EMA alignment (LTF confirmation with POI timeframe)
+    m15_bull_ema = True
+    m15_bear_ema = True
+    if ALGO_REQUIRE_M15_EMA_ALIGN and df_m15 is not None and len(df_m15) >= 55:
+        m15_e20 = float(df_m15["close"].ewm(span=20, adjust=False).mean().iloc[-1])
+        m15_e50 = float(df_m15["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+        m15_bull_ema = m15_e20 > m15_e50
+        m15_bear_ema = m15_e20 < m15_e50
+
+    if vol_ratio < ALGO_VOLUME_MIN_RATIO:
         decision["reason"] = f"Volume too low ({vol_ratio:.1f}x avg)"
         return decision
 
@@ -206,59 +274,208 @@ def run_algorithmic_decision(
     
     is_bullish_pa = ((min(c_open, c_close) - c_low > c_body * 1.8) or (c_close > c_open and c_body/c_range > 0.45))
     is_bearish_pa = ((c_high - max(c_open, c_close) > c_body * 1.8) or (c_close < c_open and c_body/c_range > 0.45))
+    m5_bull_close = c_close > c_open
+    m5_bear_close = c_close < c_open
+
+    def in_poi_band(price: float, lo, hi) -> bool:
+        lo_f, hi_f = float(lo), float(hi)
+        return (lo_f - poi_buf) <= price <= (hi_f + poi_buf)
 
     # Zones
-    in_bullish_poi = any(float(f["low"]) <= current_price <= float(f["high"]) for f in fvgs if f["type"] == "Bullish") or \
-                     any(float(o["low"]) <= current_price <= float(o["high"]) for o in obs if o["type"] == "Bullish") or \
-                     any(abs(current_price - float(s)) < (atr * 0.3) for s in sr_data.get("support", []))
+    # Debug check
+    if sr_data.get("support"):
+        for s in sr_data.get("support"):
+             if isinstance(s.get("price"), dict):
+                 log.error(f"CRITICAL: sr_data['support'] has dict as price: {s}")
+             elif not isinstance(s.get("price"), (int, float, str)):
+                 log.error(f"CRITICAL: sr_data['support'] has invalid price type: {type(s.get('price'))}")
 
-    in_bearish_poi = any(float(f["low"]) <= current_price <= float(f["high"]) for f in fvgs if f["type"] == "Bearish") or \
-                     any(float(o["low"]) <= current_price <= float(o["high"]) for o in obs if o["type"] == "Bearish") or \
-                     any(abs(current_price - float(r)) < (atr * 0.3) for r in sr_data.get("resistance", []))
+    # M15 POI zones (expanded band); ICT breakers = failed swing + reclaim
+    bull_fvg = any(
+        in_poi_band(current_price, f["low"], f["high"]) for f in fvgs if f["type"] == "Bullish"
+    )
+    bull_ob = any(
+        in_poi_band(current_price, o["low"], o["high"]) for o in obs if o["type"] == "Bullish"
+    )
+    bull_br = any(
+        in_poi_band(current_price, b["low"], b["high"]) for b in breakers if b["type"] == "Bullish"
+    )
+    bull_ict = any(
+        in_poi_band(current_price, z["low"], z["high"]) for z in ict_zones if z["type"] == "Bullish"
+    )
+    bull_sr = any(
+        abs(current_price - to_float(s)) < max(atr * 0.35, poi_buf) for s in sr_data.get("support", [])
+    )
+    in_bullish_poi = bull_fvg or bull_ob or bull_br or bull_ict or bull_sr
+    poi_conf_long = sum(
+        1
+        for x in (bull_fvg, bull_ob, bull_br, bull_ict, bull_sr, sweep_bull)
+        if x
+    )
 
-    # 5. Premium/Discount Filter
+    bear_fvg = any(
+        in_poi_band(current_price, f["low"], f["high"]) for f in fvgs if f["type"] == "Bearish"
+    )
+    bear_ob = any(
+        in_poi_band(current_price, o["low"], o["high"]) for o in obs if o["type"] == "Bearish"
+    )
+    bear_br = any(
+        in_poi_band(current_price, b["low"], b["high"]) for b in breakers if b["type"] == "Bearish"
+    )
+    bear_ict = any(
+        in_poi_band(current_price, z["low"], z["high"]) for z in ict_zones if z["type"] == "Bearish"
+    )
+    bear_sr = any(
+        abs(current_price - to_float(r)) < max(atr * 0.35, poi_buf) for r in sr_data.get("resistance", [])
+    )
+    in_bearish_poi = bear_fvg or bear_ob or bear_br or bear_ict or bear_sr
+    poi_conf_short = sum(
+        1
+        for x in (bear_fvg, bear_ob, bear_br, bear_ict, bear_sr, sweep_bear)
+        if x
+    )
+
+    struct_ok_long = (
+        market_bias == "BULLISH"
+        or struct_ctx.get("choch_bullish")
+        or struct_ctx.get("bos_bullish")
+    )
+    struct_ok_short = (
+        market_bias == "BEARISH"
+        or struct_ctx.get("choch_bearish")
+        or struct_ctx.get("bos_bearish")
+    )
+    liquidity_long_ok = (
+        sweep_bull
+        and in_bullish_poi
+        and h1_bullish
+        and trend_dir != "BEARISH"
+    )
+    liquidity_short_ok = (
+        sweep_bear
+        and in_bearish_poi
+        and h1_bearish
+        and trend_dir != "BULLISH"
+    )
+
+    structure_allows_long = struct_ok_long or (ALGO_LIQUIDITY_SHORTCUT and liquidity_long_ok)
+    structure_allows_short = struct_ok_short or (ALGO_LIQUIDITY_SHORTCUT and liquidity_short_ok)
+
+    # 5. Premium/Discount (H1 swing range)
     pd_zone = get_p_d_zones(current_price, swing_high, swing_low)
 
-    # Execution
-    if in_bullish_poi and h1_bullish and trend_dir != "BEARISH":
-        struct_ok = (market_bias == "BULLISH") or ("CHOCH Bullish" in structure_text)
-        if struct_ok:
+    # Execution — M15 POI + H1 structure + PD + M5 PA (optional liquidity shortcut)
+    if in_bullish_poi and h1_bullish and m15_bull_ema and trend_dir != "BEARISH":
+        if poi_conf_long < ALGO_MIN_POI_CONFLUENCE:
+            decision["reason"] = (
+                f"WAIT: M15 POI confluence {poi_conf_long} < {ALGO_MIN_POI_CONFLUENCE} "
+                f"(FVG/OB/retest/ICT/SR/sweep)"
+            )
+        elif structure_allows_long:
             if pd_zone in ["DISCOUNT", "EQUILIBRIUM"]:
-                if is_bullish_pa:
+                if ALGO_LIQUIDITY_SHORTCUT:
+                    pa_ok = is_bullish_pa or (liquidity_long_ok and m5_bull_close)
+                else:
+                    pa_ok = is_bullish_pa
+                if pa_ok:
                     sl, tp, rr = calculate_logical_tp_sl("BUY", current_price)
                     if rr >= 2.0:
+                        tags = [
+                            "H1 structure",
+                            structure_text,
+                            pd_zone,
+                            "M15 POI",
+                            f"POI×{poi_conf_long}",
+                        ]
+                        if is_bullish_pa:
+                            tags.append("M5 PA")
+                        if liquidity_long_ok and ALGO_LIQUIDITY_SHORTCUT:
+                            tags.append("Liquidity sweep")
+                        if struct_ctx.get("bos_bullish"):
+                            tags.append("BOS")
+                        if struct_ctx.get("choch_bullish"):
+                            tags.append("CHOCH")
+                        if bull_ict:
+                            tags.append("ICT breaker")
+                        if bull_fvg:
+                            tags.append("M15 FVG")
+                        if bull_ob:
+                            tags.append("M15 OB")
+                        conf = 95 if struct_ctx.get("choch_bullish") else 90
+                        if ALGO_LIQUIDITY_SHORTCUT and liquidity_long_ok and not is_bullish_pa:
+                            conf = min(conf, 82)
                         return {
-                            "action": "BUY", "reason": f"SMC {structure_text} | {pd_zone} | POI | M5 PA | RR 1:{rr}",
-                            "confidence": 95 if "CHOCH" in structure_text else 90,
-                            "entry": current_price, "sl": sl, "tp": tp, "rr_ratio": float(rr),
-                            "key_level": "Structural POI", "confluences": [structure_text, pd_zone, "POI", "M5 PA"]
+                            "action": "BUY",
+                            "reason": f"H1 {structure_text} | {pd_zone} | M15 POI×{poi_conf_long} | RR 1:{rr}",
+                            "confidence": conf,
+                            "entry": current_price,
+                            "sl": sl,
+                            "tp": tp,
+                            "rr_ratio": float(rr),
+                            "key_level": "M15 POI + H1 structure",
+                            "confluences": tags,
                         }
-                else:
-                    decision["reason"] = f"WAIT: {pd_zone} + Structural OK, waiting for M5 trigger"
+                decision["reason"] = f"WAIT: {pd_zone} + structure OK, need M5 trigger"
             else:
-                decision["reason"] = f"WAIT: Bullish POI but price is in {pd_zone} (Expensive)"
+                decision["reason"] = f"WAIT: Bullish M15 POI but {pd_zone} (not discount)"
         else:
-            decision["reason"] = f"WAIT: Price in POI but H1 Structure is {structure_text}"
+            decision["reason"] = f"WAIT: M15 POI but H1 bias/structure blocks ({structure_text})"
 
-    elif in_bearish_poi and h1_bearish and trend_dir != "BULLISH":
-        struct_ok = (market_bias == "BEARISH") or ("CHOCH Bearish" in structure_text)
-        if struct_ok:
+    elif in_bearish_poi and h1_bearish and m15_bear_ema and trend_dir != "BULLISH":
+        if poi_conf_short < ALGO_MIN_POI_CONFLUENCE:
+            decision["reason"] = (
+                f"WAIT: M15 POI confluence {poi_conf_short} < {ALGO_MIN_POI_CONFLUENCE} "
+                f"(FVG/OB/retest/ICT/SR/sweep)"
+            )
+        elif structure_allows_short:
             if pd_zone in ["PREMIUM", "EQUILIBRIUM"]:
-                if is_bearish_pa:
+                if ALGO_LIQUIDITY_SHORTCUT:
+                    pa_ok = is_bearish_pa or (liquidity_short_ok and m5_bear_close)
+                else:
+                    pa_ok = is_bearish_pa
+                if pa_ok:
                     sl, tp, rr = calculate_logical_tp_sl("SELL", current_price)
                     if rr >= 2.0:
+                        tags = [
+                            "H1 structure",
+                            structure_text,
+                            pd_zone,
+                            "M15 POI",
+                            f"POI×{poi_conf_short}",
+                        ]
+                        if is_bearish_pa:
+                            tags.append("M5 PA")
+                        if liquidity_short_ok and ALGO_LIQUIDITY_SHORTCUT:
+                            tags.append("Liquidity sweep")
+                        if struct_ctx.get("bos_bearish"):
+                            tags.append("BOS")
+                        if struct_ctx.get("choch_bearish"):
+                            tags.append("CHOCH")
+                        if bear_ict:
+                            tags.append("ICT breaker")
+                        if bear_fvg:
+                            tags.append("M15 FVG")
+                        if bear_ob:
+                            tags.append("M15 OB")
+                        conf = 95 if struct_ctx.get("choch_bearish") else 90
+                        if ALGO_LIQUIDITY_SHORTCUT and liquidity_short_ok and not is_bearish_pa:
+                            conf = min(conf, 82)
                         return {
-                            "action": "SELL", "reason": f"SMC {structure_text} | {pd_zone} | POI | M5 PA | RR 1:{rr}",
-                            "confidence": 95 if "CHOCH" in structure_text else 90,
-                            "entry": current_price, "sl": sl, "tp": tp, "rr_ratio": float(rr),
-                            "key_level": "Structural POI", "confluences": [structure_text, pd_zone, "POI", "M5 PA"]
+                            "action": "SELL",
+                            "reason": f"H1 {structure_text} | {pd_zone} | M15 POI×{poi_conf_short} | RR 1:{rr}",
+                            "confidence": conf,
+                            "entry": current_price,
+                            "sl": sl,
+                            "tp": tp,
+                            "rr_ratio": float(rr),
+                            "key_level": "M15 POI + H1 structure",
+                            "confluences": tags,
                         }
-                else:
-                    decision["reason"] = f"WAIT: {pd_zone} + Structural OK, waiting for M5 trigger"
+                decision["reason"] = f"WAIT: {pd_zone} + structure OK, need M5 trigger"
             else:
-                decision["reason"] = f"WAIT: Bearish POI but price is in {pd_zone} (Cheap)"
+                decision["reason"] = f"WAIT: Bearish M15 POI but {pd_zone} (not premium)"
         else:
-            decision["reason"] = f"WAIT: Price in POI but H1 Structure is {structure_text}"
+            decision["reason"] = f"WAIT: M15 POI but H1 bias/structure blocks ({structure_text})"
 
     return decision
 
@@ -300,6 +517,16 @@ def main():
     current_day = datetime.now(GMT).date()
 
     log.info(f"Pairs: {', '.join(tradable_symbols)} | Max trades: {MAX_TRADES_DAY}/day")
+    log.info("Schedule: 24/5 — scans all UTC hours Mon–Fri; Sat/Sun sleep 5m (no new trades).")
+    log.info(
+        "Pure algo: H1=BOS/CHOCH+EMA+PD | M15=POI (FVG,OB,retest,ICT breaker) | "
+        f"M5 confirm={'ON' if ALGO_REQUIRE_M5_CONFIRM else 'OFF'} | "
+        f"MTF confirm={'ON' if ALGO_REQUIRE_MTF_CONFIRM else 'OFF'} "
+        f"(min {ALGO_MTF_MIN_CONFIDENCE}%) | "
+        f"min POI confluence={ALGO_MIN_POI_CONFLUENCE} | "
+        f"M15 EMA filter={'ON' if ALGO_REQUIRE_M15_EMA_ALIGN else 'OFF'} | "
+        f"liquidity shortcut={'ON' if ALGO_LIQUIDITY_SHORTCUT else 'OFF'}"
+    )
     log.info("Bot running. Press Ctrl+C to stop.\n")
 
     while True:
@@ -340,9 +567,11 @@ def main():
                             symbol_last_trade_time[s] = now
                             log.info(f"[{s}] Position closed. 10m Cooldown timer started.")
 
-            # ── Session check ──
+            # ── Weekday check (24h Mon–Fri UTC week; no trades Sat/Sun) ──
             if not is_trading_session():
-                log.info(f"Outside session ({now.strftime('%H:%M')} UTC). Sleeping 5 min...")
+                log.info(
+                    f"Weekend — bot idle 24/5 mode ({now.strftime('%a %H:%M')} UTC). Sleeping 5 min..."
+                )
                 time.sleep(300)
                 continue
 
@@ -414,13 +643,16 @@ def main():
 
                 # ── Run all analyses ──
                 # SMC
-                # SMC Analysis (H1 Structural Bias + M15 POIs)
-                smc_h1 = get_market_bias(df_h1)
+                # H1 = structure only; M15 = all POI (FVG, OB, retests, ICT breakers)
+                smc_h1 = get_enriched_market_structure(df_h1)
                 smc_data = {
-                    "order_blocks": detect_order_blocks(df_h1),
-                    "fvgs":         detect_fvg(df_m15, base_symbol=base_symbol),
-                    "bos_choch":    smc_h1["structure"],
-                    "bias":         smc_h1["bias"]
+                    "order_blocks":    detect_order_blocks(df_m15),
+                    "breaker_retests": detect_breaker_retests(df_m15),
+                    "ict_breakers":    detect_ict_breaker_blocks(df_m15, base_symbol=base_symbol),
+                    "fvgs":            detect_fvg(df_m15, base_symbol=base_symbol),
+                    "bos_choch":       smc_h1["structure"],
+                    "bias":            smc_h1["bias"],
+                    "structure_ctx":   smc_h1,
                 }
 
                 # Patterns
@@ -444,9 +676,12 @@ def main():
                 volume_info = get_volume_profile(df_m15)
                 atr_m15 = calculate_atr(df_m15)
                 atr_h1  = calculate_atr(df_h1)
+                atr_m15_last = (
+                    float(atr_m15.iloc[-1]) if hasattr(atr_m15, "iloc") else float(atr_m15)
+                )
 
                 # ── Pre-filter: Skip API call if no point of interest ──
-                near = is_near_poi(current_price, smc_data, base_symbol)
+                near = is_near_poi(current_price, smc_data, base_symbol, atr=atr_m15_last)
                 if not near and not patterns and not sweeps:
                     continue
 
@@ -455,12 +690,15 @@ def main():
                     symbol=symbol,
                     current_price=current_price,
                     df_m5=df_m5,
+                    df_m15=df_m15,
                     smc_data=smc_data,
                     atr_m15_raw=atr_m15,
                     htf_trend=htf_trend,
                     volume_info=volume_info,
                     df_h1=df_h1,
-                    sr_data=sr_data
+                    sr_data=sr_data,
+                    sweeps=sweeps,
+                    base_symbol=base_symbol,
                 )
 
                 # ── Log the signal ──
@@ -502,21 +740,24 @@ def main():
                 # Gate 6: M5 entry confirmation
                 m5_ok, m5_pattern = confirm_m5_entry(df_m5, action)
                 if not m5_ok:
-                    log.info(f"[{symbol}] ⚠️ M5 confirmation missing: {m5_pattern}. (Bypassed)")
-                    # continue  # BYPASSED
+                    if ALGO_REQUIRE_M5_CONFIRM:
+                        log.info(f"[{symbol}] ❌ M5 confirmation missing: {m5_pattern}. Skip.")
+                        continue
+                    log.info(f"[{symbol}] ⚠️ M5 confirmation missing: {m5_pattern}. (optional OFF)")
                 else:
                     log.info(f"[{symbol}] ✅ M5 confirmed: {m5_pattern}")
 
                 # Gate 7: Multi-timeframe confirmation (M5 + M15 + H1 alignment)
                 mtf_confirmed, mtf_reason, mtf_analysis = get_multi_timeframe_confirmation(
-                    symbol, action, df_m5, df_m15, df_h1, min_confidence=70.0
+                    symbol, action, df_m5, df_m15, df_h1, min_confidence=ALGO_MTF_MIN_CONFIDENCE
                 )
                 if not mtf_confirmed:
-                    log.info(f"[{symbol}] ⚠️ Multi-timeframe confirmation missing: {mtf_reason} (Bypassed)")
-                    # continue  # BYPASSED
+                    if ALGO_REQUIRE_MTF_CONFIRM:
+                        log.info(f"[{symbol}] ❌ MTF confirmation missing: {mtf_reason}. Skip.")
+                        continue
+                    log.info(f"[{symbol}] ⚠️ MTF confirmation missing: {mtf_reason}. (optional OFF)")
                 else:
                     log.info(f"[{symbol}] ✅ Multi-timeframe confirmed: {mtf_analysis['summary']}")
-                log.info(f"[{symbol}] ✅ Multi-timeframe confirmed: {mtf_analysis['summary']}")
 
                 # Append confirmations to UI dashboard tags
                 confirmations = []
