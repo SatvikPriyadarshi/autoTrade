@@ -15,7 +15,7 @@ from config.settings import (
     validate_required_env,
     SYMBOLS, TIMEFRAME_H4, TIMEFRAME_H1, TIMEFRAME_M15, TIMEFRAME_M5,
     CANDLES, CANDLES_HTF, CANDLES_M5, MAX_SPREAD, MIN_CONFIDENCE, MIN_RR_RATIO,
-    MAX_RISK_PER_TRADE_USD, MAX_TRADES_PER_SYMBOL_PER_DAY,
+    MAX_TRADES_PER_SYMBOL_PER_DAY,
     SYMBOL_COOLDOWN_MIN, LOSS_COOLDOWN_MIN, SLEEP_SEC,
     MAX_TRADES_DAY, POI_BUFFER_PIPS, PIP_VALUE,
     NEWS_FILTER_ENABLED, NEWS_BLACKOUT_MINUTES,
@@ -31,7 +31,7 @@ from config.settings import (
 from core.mt5_client import (
     connect_mt5, ensure_connected, resolve_all_symbols,
     get_base_symbol, get_candles, get_spread, get_current_price,
-    has_open_position, calculate_lot_size, calculate_atr,
+    has_open_position, calculate_atr,
     get_volume_profile, place_order,
 )
 from core.position_manager import PositionManager
@@ -53,12 +53,14 @@ from analysis.support_resistance import detect_support_resistance, format_sr_for
 from analysis.liquidity import detect_liquidity_sweeps, detect_equal_highs_lows, format_liquidity_for_prompt
 from analysis.trend import detect_htf_trend, is_trade_aligned_with_trend
 from analysis.multi_timeframe import get_multi_timeframe_confirmation, format_multi_timeframe_for_prompt
+from analysis.trade_levels import validate_trade_plan
 
 # ── Removed AI imports for pure-algo ──
 
 # ── Risk ──
 from risk.manager import RiskManager
 from risk.news_filter import has_upcoming_high_impact_news
+from risk.sizer import size_position
 
 # ── Logging ──
 from trade_logger.logger import TradeLogger
@@ -102,6 +104,55 @@ def is_symbol_in_optimal_session(base_symbol: str) -> bool:
     if hour in session.get("avoid_hours", []):
         return False
     return True
+
+
+def sync_open_bot_positions(pos_manager: PositionManager):
+    """
+    Recover tracking after bot restart:
+    register any currently open bot positions not present in memory.
+    """
+    open_positions = mt5.positions_get() or []
+    recovered = 0
+    for pos in open_positions:
+        if getattr(pos, "magic", None) != BOT_MAGIC:
+            continue
+        ticket = int(getattr(pos, "ticket", 0) or 0)
+        if ticket <= 0 or ticket in pos_manager.tracked:
+            continue
+
+        direction = "BUY" if pos.type == mt5.ORDER_TYPE_BUY else "SELL"
+        symbol = get_base_symbol(getattr(pos, "symbol", ""))
+        entry = float(getattr(pos, "price_open", 0.0) or 0.0)
+        sl = float(getattr(pos, "sl", 0.0) or 0.0)
+        tp = float(getattr(pos, "tp", 0.0) or 0.0)
+        volume = float(getattr(pos, "volume", 0.0) or 0.0)
+
+        if entry <= 0 or volume <= 0:
+            continue
+
+        pip = PIP_VALUE.get(symbol, 0.0001)
+        be_buffer = 2 * pip  # mirror BREAKEVEN_BUFFER_PIPS default behavior
+        be_applied = False
+        if sl > 0:
+            if direction == "BUY" and sl >= (entry + be_buffer * 0.5):
+                be_applied = True
+            if direction == "SELL" and sl <= (entry - be_buffer * 0.5):
+                be_applied = True
+
+        pos_manager.register_trade(
+            ticket=ticket,
+            symbol=symbol,
+            direction=direction,
+            entry=entry,
+            sl=sl if sl > 0 else (entry - (10 * pip) if direction == "BUY" else entry + (10 * pip)),
+            tp=tp if tp > 0 else entry,
+            volume=volume,
+            be_applied=be_applied,
+        )
+        recovered += 1
+
+    if recovered > 0:
+        log.info(f"[PositionManager] Recovered and re-tracked {recovered} open bot position(s).")
 
 
 # ──────────────────────────────────────────────
@@ -380,6 +431,20 @@ def run_algorithmic_decision(
                 if pa_ok:
                     sl, tp, rr = calculate_logical_tp_sl("BUY", current_price)
                     if rr >= 2.0:
+                        ok_plan, plan_reason = validate_trade_plan(
+                            direction="BUY",
+                            entry=current_price,
+                            sl=sl,
+                            tp=tp,
+                            rr=rr,
+                            atr=atr,
+                            pip=pip,
+                            swing_low=swing_low,
+                            swing_high=swing_high,
+                        )
+                        if not ok_plan:
+                            decision["reason"] = f"WAIT: {plan_reason}"
+                            return decision
                         tags = [
                             "H1 structure",
                             structure_text,
@@ -436,6 +501,20 @@ def run_algorithmic_decision(
                 if pa_ok:
                     sl, tp, rr = calculate_logical_tp_sl("SELL", current_price)
                     if rr >= 2.0:
+                        ok_plan, plan_reason = validate_trade_plan(
+                            direction="SELL",
+                            entry=current_price,
+                            sl=sl,
+                            tp=tp,
+                            rr=rr,
+                            atr=atr,
+                            pip=pip,
+                            swing_low=swing_low,
+                            swing_high=swing_high,
+                        )
+                        if not ok_plan:
+                            decision["reason"] = f"WAIT: {plan_reason}"
+                            return decision
                         tags = [
                             "H1 structure",
                             structure_text,
@@ -559,6 +638,7 @@ def main():
                 symbol_last_was_loss   = {s: False for s in tradable_symbols}
 
             # ── Manage open positions (breakeven, trailing, outcome tracking) ──
+            sync_open_bot_positions(pos_manager)
             recently_closed = pos_manager.manage_all()
             if recently_closed:
                 for closed_base in recently_closed:
@@ -748,14 +828,23 @@ def main():
                     log.info(f"[{symbol}] ✅ M5 confirmed: {m5_pattern}")
 
                 # Gate 7: Multi-timeframe confirmation (M5 + M15 + H1 alignment)
+                high_conf_bypass = confidence >= 90
                 mtf_confirmed, mtf_reason, mtf_analysis = get_multi_timeframe_confirmation(
                     symbol, action, df_m5, df_m15, df_h1, min_confidence=ALGO_MTF_MIN_CONFIDENCE
                 )
                 if not mtf_confirmed:
-                    if ALGO_REQUIRE_MTF_CONFIRM:
-                        log.info(f"[{symbol}] ❌ MTF confirmation missing: {mtf_reason}. Skip.")
+                    if high_conf_bypass:
+                        log.info(
+                            f"[{symbol}] ⚠️ MTF not confirmed ({mtf_reason}) but bypassed due to high confidence ({confidence}%)."
+                        )
+                    elif ALGO_REQUIRE_MTF_CONFIRM:
+                        log.info(
+                            f"[{symbol}] ❌ MTF confirmation missing: {mtf_reason}. "
+                            f"Skip (confidence={confidence}%, bypass>=90%)."
+                        )
                         continue
-                    log.info(f"[{symbol}] ⚠️ MTF confirmation missing: {mtf_reason}. (optional OFF)")
+                    else:
+                        log.info(f"[{symbol}] ⚠️ MTF confirmation missing: {mtf_reason}. (optional OFF)")
                 else:
                     log.info(f"[{symbol}] ✅ Multi-timeframe confirmed: {mtf_analysis['summary']}")
 
@@ -776,17 +865,17 @@ def main():
                 # ──────────────────────────────────────
 
                 entry = current_price  # Always use live price
-                lot = calculate_lot_size(symbol, action, entry, sl)
-
-                # Final risk cap check
-                est_loss = abs(mt5.order_calc_profit(
-                    mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL,
-                    symbol, lot, entry, sl
-                ) or 0.0)
-
-                if est_loss > MAX_RISK_PER_TRADE_USD:
-                    log.info(f"[{symbol}] Est loss ${est_loss:.2f} > cap ${MAX_RISK_PER_TRADE_USD:.2f}. Skip.")
+                size_info = size_position(symbol, action, entry, sl)
+                if not size_info.get("ok"):
+                    log.info(f"[{symbol}] X Sizing rejected: {size_info.get('reason')}")
                     continue
+                lot = float(size_info.get("lot", 0.0))
+                est_loss = float(size_info.get("est_loss", 0.0))
+
+                log.info(
+                    f"[{symbol}] Risk packet | entry={entry:.5f} sl={sl:.5f} tp={tp:.5f} rr={rr:.2f} "
+                    f"lot={lot:.2f} est_loss=${est_loss:.2f} budget=${size_info.get('risk_budget', 0.0):.2f}"
+                )
 
                 # ── Place order ──
                 success, order_error, ticket = place_order(symbol, action, lot, sl, tp)
@@ -848,3 +937,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

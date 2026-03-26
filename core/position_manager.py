@@ -14,7 +14,7 @@ import MetaTrader5 as mt5
 from config.settings import (
     PIP_VALUE, MIN_LOT,
     BREAKEVEN_TRIGGER_RR, BREAKEVEN_BUFFER_PIPS,
-    TRAIL_TRIGGER_RR, TRAIL_STEP_RATIO,
+    TRAIL_TRIGGER_RR, TRAIL_STEP_RATIO, TRAIL_LOCK_RR, TRAIL_MIN_MOVE_PIPS, TRAIL_UPDATE_COOLDOWN_SEC,
     MAX_TRADE_DURATION_MIN, INTRADAY_MODE,
     PARTIAL_TP_ENABLED, PARTIAL_TP_TRIGGER_RR,
     PARTIAL_TP_PERCENTAGE, PARTIAL_TP_MIN_LOT,
@@ -51,6 +51,7 @@ class PositionManager:
         sl: float,
         tp: float,
         volume: float,  # Added to track position size for partial TP
+        be_applied: bool = False,
     ):
         """Register a newly opened trade for management."""
         risk_distance = abs(entry - sl)
@@ -63,10 +64,11 @@ class PositionManager:
             "original_sl":    sl,
             "risk_distance":  risk_distance,
             "volume":         volume,  # Track volume for partial TP
-            "be_applied":     False,
+            "be_applied":     bool(be_applied),
             "partial_tp_applied": False,  # Track if partial TP has been taken
             "remaining_volume": volume,  # Track remaining volume after partial TP
             "open_time":      datetime.now(timezone.utc),
+            "last_trail_update": None,
         }
         log.info(f"[PositionManager] Tracking ticket {ticket} | {symbol} {direction} | "
                 f"Volume: {volume} | Risk: {risk_distance:.5f}")
@@ -317,20 +319,32 @@ class PositionManager:
                             info["be_applied"] = True
                             log.info(f"[PositionManager] BREAKEVEN | Ticket {ticket} | New SL: {new_sl:.5f} | Vol Confirmed: {VOLUME_CONFIRMATION_ENABLED}")
 
-        # -- TRAILING STOP: Trail SL behind price after 1.5R --
+        # -- TRAILING STOP: staged and throttled updates to avoid over-tight stops --
         if info["be_applied"] and profit_in_r >= TRAIL_TRIGGER_RR:
+            now_utc = datetime.now(timezone.utc)
+            last_update = info.get("last_trail_update")
+            if last_update and (now_utc - last_update).total_seconds() < TRAIL_UPDATE_COOLDOWN_SEC:
+                return
+
             trail_distance = risk_distance * TRAIL_STEP_RATIO
+            min_move = TRAIL_MIN_MOVE_PIPS * pip
 
             if direction == "BUY":
-                new_sl = current_price - trail_distance
-                if new_sl > current_sl:
-                    modify_position_sl(ticket, new_sl)
-                    log.info(f"[PositionManager] TRAIL SL | Ticket {ticket} | {current_sl:.5f} -> {new_sl:.5f}")
+                raw_sl = current_price - trail_distance
+                lock_sl = entry + (risk_distance * TRAIL_LOCK_RR)
+                new_sl = max(raw_sl, lock_sl)
+                if new_sl > current_sl + min_move:
+                    if modify_position_sl(ticket, new_sl):
+                        info["last_trail_update"] = now_utc
+                        log.info(f"[PositionManager] TRAIL SL | Ticket {ticket} | {current_sl:.5f} -> {new_sl:.5f} | R={profit_in_r:.2f}")
             else:  # SELL
-                new_sl = current_price + trail_distance
-                if new_sl < current_sl or current_sl == 0:
-                    modify_position_sl(ticket, new_sl)
-                    log.info(f"[PositionManager] TRAIL SL | Ticket {ticket} | {current_sl:.5f} -> {new_sl:.5f}")
+                raw_sl = current_price + trail_distance
+                lock_sl = entry - (risk_distance * TRAIL_LOCK_RR)
+                new_sl = min(raw_sl, lock_sl)
+                if current_sl == 0 or new_sl < current_sl - min_move:
+                    if modify_position_sl(ticket, new_sl):
+                        info["last_trail_update"] = now_utc
+                        log.info(f"[PositionManager] TRAIL SL | Ticket {ticket} | {current_sl:.5f} -> {new_sl:.5f} | R={profit_in_r:.2f}")
 
     def get_tracked_count(self) -> int:
         return len(self.tracked)

@@ -23,6 +23,7 @@ HISTORY_DIR  = os.path.join(LOG_DIR, "history")
 TRADES_FILE  = os.path.join(LOG_DIR, "trades.csv")
 SIGNALS_FILE = os.path.join(LOG_DIR, "signals.csv")
 IST = ZoneInfo("Asia/Kolkata")
+BOT_MAGIC = 20250101
 
 
 # ──────────────────────────────────────────────
@@ -117,7 +118,13 @@ def get_mt5_account_snapshot() -> dict:
             pass
 
 
-def get_mt5_realized_daily_map(days_back: int = 120) -> dict:
+def _is_bot_deal(deal) -> bool:
+    magic = int(getattr(deal, "magic", 0) or 0)
+    comment = str(getattr(deal, "comment", "") or "")
+    return magic == BOT_MAGIC or "SMC_AI_BOT" in comment or "SMC_" in comment
+
+
+def get_mt5_realized_daily_map(days_back: int = 120, only_bot: bool = True) -> dict:
     """
     Return realized P/L per day from MT5 deal history.
     Includes profit + commission + swap for DEAL_ENTRY_OUT deals.
@@ -138,6 +145,8 @@ def get_mt5_realized_daily_map(days_back: int = 120) -> dict:
         }
 
         for d in deals:
+            if only_bot and not _is_bot_deal(d):
+                continue
             symbol = str(getattr(d, "symbol", "") or "")
             entry = getattr(d, "entry", None)
             realized = float(getattr(d, "profit", 0.0)) + float(getattr(d, "commission", 0.0)) + float(getattr(d, "swap", 0.0))
@@ -162,7 +171,7 @@ def get_mt5_realized_daily_map(days_back: int = 120) -> dict:
             pass
 
 
-def get_mt5_closed_trade_count_daily(days_back: int = 120) -> dict:
+def get_mt5_closed_trade_count_daily(days_back: int = 120, only_bot: bool = True) -> dict:
     daily = defaultdict(int)
     try:
         if not mt5.initialize():
@@ -177,6 +186,8 @@ def get_mt5_closed_trade_count_daily(days_back: int = 120) -> dict:
             getattr(mt5, "DEAL_ENTRY_INOUT", 2),
         }
         for d in deals:
+            if only_bot and not _is_bot_deal(d):
+                continue
             symbol = str(getattr(d, "symbol", "") or "")
             if not symbol:
                 continue
@@ -270,8 +281,8 @@ def get_stats():
     total_signals = len(signals)
     hold_signals  = len([s for s in signals if s.get("action") == "HOLD"])
     mt5_snapshot = get_mt5_account_snapshot()
-    mt5_realized_daily = get_mt5_realized_daily_map(days_back=120)
-    mt5_closed_count_daily = get_mt5_closed_trade_count_daily(days_back=120)
+    mt5_realized_daily = get_mt5_realized_daily_map(days_back=120, only_bot=False)
+    mt5_closed_count_daily = get_mt5_closed_trade_count_daily(days_back=120, only_bot=False)
     account_balance = mt5_snapshot.get("account_balance", 0.0)
     account_equity = mt5_snapshot.get("account_equity", 0.0)
     open_pnl = mt5_snapshot.get("account_profit_open", 0.0)
@@ -288,7 +299,9 @@ def get_stats():
     today_realized_pnl = today_realized_mt5 if mt5_realized_daily else today_realized_from_logs
     today_trades_count = int(mt5_closed_count_daily.get(today_ist, 0)) if mt5_closed_count_daily else len(today_trades_logs)
     total_pnl = realized_pnl + open_pnl
-    today_pnl = today_realized_pnl + open_pnl
+    # "Today's P&L" should reflect today's realized result in IST;
+    # open/floating P&L is shown separately in Open P&L card.
+    today_pnl = today_realized_pnl
 
     return jsonify({
         "total_trades":    total_trades,
@@ -307,6 +320,7 @@ def get_stats():
         "today_trades":    today_trades_count,
         "today_pnl":       round(today_pnl, 2),
         "today_realized_pnl": round(today_realized_pnl, 2),
+        "today_open_pnl":  round(open_pnl, 2),
         "best_trade_pnl":  round(safe_float(best.get("pnl") if best else 0), 2),
         "worst_trade_pnl": round(safe_float(worst.get("pnl") if worst else 0), 2),
         "account_balance": round(account_balance, 2),
@@ -375,11 +389,14 @@ def get_daily_breakdown():
     trades = read_all_trades()
     daily = defaultdict(float)
     for t in trades:
-        day = t.get("timestamp", "")[:10]
+        ts = t.get("timestamp", "")
+        day = utc_log_ts_to_ist_date(ts) or (ts[:10] if ts else "")
+        if not day:
+            continue
         daily[day] += safe_float(t.get("pnl"))
 
     # Overlay MT5 realized history so manual/external closes are reflected.
-    mt5_realized_daily = get_mt5_realized_daily_map(days_back=120)
+    mt5_realized_daily = get_mt5_realized_daily_map(days_back=120, only_bot=False)
     for d, pnl in mt5_realized_daily.items():
         daily[d] = pnl
 
