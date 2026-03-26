@@ -15,7 +15,7 @@ from datetime import datetime, date, timedelta, timezone
 from collections import defaultdict
 from zoneinfo import ZoneInfo
 
-app = Flask(__name__, static_folder="dashboard")
+app = Flask(__name__, static_folder="Dashboard")
 CORS(app)
 
 LOG_DIR      = "logs"
@@ -561,7 +561,7 @@ def get_bot_thinking():
 # ──────────────────────────────────────────────
 @app.route("/")
 def index():
-    return send_from_directory("dashboard", "index.html")
+    return send_from_directory("Dashboard", "index.html")
 
 
 if __name__ == "__main__":
