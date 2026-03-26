@@ -1,9 +1,10 @@
 """
-Position Manager — Manages open trades with breakeven, trailing stop, and outcome tracking.
-Runs each loop iteration to:
-  1. Move SL to breakeven when profit reaches 1:1 R
-  2. Trail SL to lock in profits beyond 1.5R
-  3. Detect closed positions and update trade logs with WIN/LOSS + actual P&L
+Position Manager — Manages open trades with breakeven, partial TP, trailing stop, and outcome tracking.
+Each loop iteration:
+  1. Optional partial close (default 50% at PARTIAL_TP_TRIGGER_RR, usually 2R)
+  2. Breakeven SL at BREAKEVEN_TRIGGER_RR (default 1R)
+  3. Trail SL after TRAIL_TRIGGER_RR (default 1.5R)
+  4. Closed positions → trade log WIN/LOSS + real P&L
 """
 
 import logging
@@ -11,11 +12,11 @@ from datetime import datetime, timedelta, timezone
 import MetaTrader5 as mt5
 
 from config.settings import (
-    BOT_MAGIC, PIP_VALUE,
+    PIP_VALUE, MIN_LOT,
     BREAKEVEN_TRIGGER_RR, BREAKEVEN_BUFFER_PIPS,
     TRAIL_TRIGGER_RR, TRAIL_STEP_RATIO,
     MAX_TRADE_DURATION_MIN, INTRADAY_MODE,
-    PARTIAL_TP_ENABLED, PARTIAL_TP_TRIGGER_RR, 
+    PARTIAL_TP_ENABLED, PARTIAL_TP_TRIGGER_RR,
     PARTIAL_TP_PERCENTAGE, PARTIAL_TP_MIN_LOT,
     VOLUME_CONFIRMATION_ENABLED, VOLUME_CONFIRMATION_MIN_RATIO,
 )
@@ -27,6 +28,7 @@ log = logging.getLogger("smc_bot")
 class PositionManager:
     """
     Tracks bot-managed positions and applies:
+      - Partial TP: close PARTIAL_TP_PERCENTAGE of volume when profit >= PARTIAL_TP_TRIGGER_RR x risk
       - Breakeven: move SL to entry +/- buffer when profit >= BREAKEVEN_TRIGGER_RR x risk
       - Trailing stop: trail SL behind price at TRAIL_STEP_RATIO x risk distance
       - Stale trade killer: closes trades older than MAX_TRADE_DURATION_MIN
@@ -258,30 +260,34 @@ class PositionManager:
         pip = PIP_VALUE.get(base_symbol, 0.0001)
         be_buffer = BREAKEVEN_BUFFER_PIPS * pip
 
-        # -- PARTIAL TAKE-PROFIT: Close 50% at 1R profit --
-        if (PARTIAL_TP_ENABLED and not info["partial_tp_applied"] and 
-            profit_in_r >= PARTIAL_TP_TRIGGER_RR and
-            current_volume >= PARTIAL_TP_MIN_LOT):
-            
-            # Check if we have enough volume to take partial profit
-            if current_volume * PARTIAL_TP_PERCENTAGE >= 0.01:  # Minimum lot size
-                success, closed_pnl = close_partial_position(ticket, PARTIAL_TP_PERCENTAGE)
-                if success:
-                    info["partial_tp_applied"] = True
-                    info["remaining_volume"] = current_volume * (1 - PARTIAL_TP_PERCENTAGE)
-                    
-                    # Update trade logger with partial close
-                    self.trade_logger.update_partial_close(
-                        ticket, 
-                        PARTIAL_TP_PERCENTAGE, 
-                        closed_pnl,
-                        f"Partial TP at {profit_in_r:.1f}R"
-                    )
-                    
-                    log.info(f"[PositionManager] PARTIAL TP {PARTIAL_TP_PERCENTAGE*100:.0f}% | "
-                            f"Ticket {ticket} | Closed {PARTIAL_TP_PERCENTAGE*100:.0f}% at {profit_in_r:.1f}R")
-                else:
-                    log.warning(f"[PositionManager] Failed to take partial TP for ticket {ticket}")
+        # -- PARTIAL TAKE-PROFIT (default: 50% at 2R; override via PARTIAL_TP_TRIGGER_RR) --
+        min_lot_symbol = float(MIN_LOT.get(base_symbol, 0.01))
+        partial_volume = current_volume * PARTIAL_TP_PERCENTAGE
+        if (
+            PARTIAL_TP_ENABLED
+            and not info["partial_tp_applied"]
+            and profit_in_r >= PARTIAL_TP_TRIGGER_RR
+            and current_volume >= PARTIAL_TP_MIN_LOT
+            and partial_volume >= min_lot_symbol
+        ):
+            success, closed_pnl = close_partial_position(ticket, PARTIAL_TP_PERCENTAGE)
+            if success:
+                info["partial_tp_applied"] = True
+                info["remaining_volume"] = current_volume * (1 - PARTIAL_TP_PERCENTAGE)
+
+                self.trade_logger.update_partial_close(
+                    ticket,
+                    PARTIAL_TP_PERCENTAGE,
+                    closed_pnl,
+                    f"Partial TP at {profit_in_r:.1f}R (trigger {PARTIAL_TP_TRIGGER_RR}R)",
+                )
+
+                log.info(
+                    f"[PositionManager] PARTIAL TP {PARTIAL_TP_PERCENTAGE*100:.0f}% | "
+                    f"Ticket {ticket} | Closed at {profit_in_r:.1f}R (trigger={PARTIAL_TP_TRIGGER_RR}R)"
+                )
+            else:
+                log.warning(f"[PositionManager] Failed to take partial TP for ticket {ticket}")
 
         # -- BREAKEVEN: Move SL to entry when profit >= 1R --
         if not info["be_applied"] and profit_in_r >= BREAKEVEN_TRIGGER_RR:

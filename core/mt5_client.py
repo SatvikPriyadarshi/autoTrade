@@ -544,14 +544,23 @@ def close_partial_position(ticket: int, percentage: float) -> tuple[bool, float]
     if not pos:
         return False, 0.0
     
-    # Calculate volume to close
-    close_volume = round(pos.volume * percentage, 2)
-    if close_volume < 0.01:  # Minimum lot size
-        log.warning(f"Cannot close partial: volume {close_volume} too small for ticket {ticket}")
+    sym = mt5.symbol_info(pos.symbol)
+    vol_min = float(getattr(sym, "volume_min", 0.01) or 0.01) if sym else 0.01
+    vol_step = float(getattr(sym, "volume_step", 0.01) or 0.01) if sym else 0.01
+    if vol_step <= 0:
+        vol_step = 0.01
+
+    target = pos.volume * percentage
+    steps = max(0, int(round(target / vol_step)))
+    close_volume = round(min(steps * vol_step, pos.volume), 8)
+    if close_volume < vol_min and target >= vol_min:
+        steps = max(1, int(round(vol_min / vol_step)))
+        close_volume = round(min(steps * vol_step, pos.volume), 8)
+    if close_volume < vol_min:
+        log.warning(
+            f"Cannot close partial: volume {close_volume} < symbol min {vol_min} (ticket {ticket})"
+        )
         return False, 0.0
-    
-    # Ensure we don't close more than we have
-    close_volume = min(close_volume, pos.volume)
     
     # Close = opposite order
     close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
