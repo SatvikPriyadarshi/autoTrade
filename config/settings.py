@@ -88,6 +88,23 @@ MIN_CONFIDENCE = 75
 MIN_RR_RATIO   = 2.0
 SLEEP_SEC      = 60
 
+# Pure algorithmic mode: do not require Anthropic API key at startup
+PURE_ALGO_MODE = os.getenv("PURE_ALGO_MODE", "true").lower() == "true"
+
+# Algorithmic entry tuning (more POI reach + sweep/BOS paths → more trades, still gated by H4/RR)
+ALGO_VOLUME_MIN_RATIO = float(os.getenv("ALGO_VOLUME_MIN_RATIO", "0.5"))
+ALGO_POI_ATR_MULT = float(os.getenv("ALGO_POI_ATR_MULT", "0.35"))
+ALGO_POI_EXTRA_PIPS = int(os.getenv("ALGO_POI_EXTRA_PIPS", "3"))
+
+# Structure (BOS/CHOCH/bias) = H1; POI (OB/FVG/breakers) = M15 — see main.build_smc_context
+# Extra confirmations (no AI): M5 pattern + multi-timeframe + POI confluence
+ALGO_REQUIRE_M5_CONFIRM = os.getenv("ALGO_REQUIRE_M5_CONFIRM", "true").lower() == "true"
+ALGO_REQUIRE_MTF_CONFIRM = os.getenv("ALGO_REQUIRE_MTF_CONFIRM", "true").lower() == "true"
+ALGO_MTF_MIN_CONFIDENCE = float(os.getenv("ALGO_MTF_MIN_CONFIDENCE", "70"))
+ALGO_MIN_POI_CONFLUENCE = int(os.getenv("ALGO_MIN_POI_CONFLUENCE", "2"))
+ALGO_LIQUIDITY_SHORTCUT = os.getenv("ALGO_LIQUIDITY_SHORTCUT", "false").lower() == "true"
+ALGO_REQUIRE_M15_EMA_ALIGN = os.getenv("ALGO_REQUIRE_M15_EMA_ALIGN", "true").lower() == "true"
+
 # Lot size safety clamps per symbol
 MIN_LOT = {s: 0.01 for s in SYMBOLS}
 MAX_LOT = {s: 5.00 for s in SYMBOLS}
@@ -101,9 +118,9 @@ BREAKEVEN_BUFFER_PIPS = 2      # Buffer above entry for BE (covers spread)
 TRAIL_TRIGGER_RR      = 1.5    # Start trailing after 1.5R profit
 TRAIL_STEP_RATIO      = 0.5    # Trail SL at 50% of risk distance behind price
 
-# Partial take-profit settings
+# Partial take-profit settings (default: bank partial at 2R; BE still at 1R, trail from 1.5R)
 PARTIAL_TP_ENABLED     = os.getenv("PARTIAL_TP_ENABLED", "true").lower() == "true"
-PARTIAL_TP_TRIGGER_RR  = float(os.getenv("PARTIAL_TP_TRIGGER_RR", "1.0"))
+PARTIAL_TP_TRIGGER_RR  = float(os.getenv("PARTIAL_TP_TRIGGER_RR", "2.0"))
 PARTIAL_TP_PERCENTAGE  = float(os.getenv("PARTIAL_TP_PERCENTAGE", "0.5"))
 PARTIAL_TP_MIN_LOT     = float(os.getenv("PARTIAL_TP_MIN_LOT", "0.02"))
 
@@ -196,11 +213,12 @@ RESOLVED_SYMBOL_TO_BASE: dict[str, str] = {}
 def validate_required_env() -> bool:
     """Verify all required secrets are present."""
     required = {
-        "MT5_LOGIN":       str(MT5_LOGIN),
-        "MT5_PASSWORD":    MT5_PASSWORD,
-        "MT5_SERVER":      MT5_SERVER,
-        "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
+        "MT5_LOGIN":    str(MT5_LOGIN),
+        "MT5_PASSWORD": MT5_PASSWORD,
+        "MT5_SERVER":   MT5_SERVER,
     }
+    if not PURE_ALGO_MODE:
+        required["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
     missing = [k for k, v in required.items() if not v or v == "0"]
     if missing:
         log.error(f"Missing required env vars: {', '.join(missing)}")
