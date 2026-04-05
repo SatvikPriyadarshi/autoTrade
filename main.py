@@ -1,5 +1,5 @@
 """
-SMC + Price Action AI Trading Bot — Main Entry Point
+Satvik bt-1 (SMC) — Main Entry Point
 Enhanced with: HTF trend filter, S/R detection, liquidity sweeps,
 news filter, SL/TP validation, breakeven/trailing stop, outcome tracking.
 
@@ -562,7 +562,7 @@ def run_algorithmic_decision(
 # ──────────────────────────────────────────────
 def main():
     log.info("=" * 60)
-    log.info("  SMC + Price Action AI Trading Bot v2.0 (INTRADAY/SCALPING)")
+    log.info("  Satvik bt-1 (SMC) v2.0 — INTRADAY/SCALPING")
     log.info("  HTF trend | S/R | Liquidity | News | Trailing SL | Auto-close")
     log.info("=" * 60)
 

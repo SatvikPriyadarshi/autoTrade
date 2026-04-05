@@ -5,7 +5,7 @@ REM Always run from this script's directory
 cd /d "%~dp0"
 
 echo ============================================
-echo   SMC AI Trading Bot - Startup Launcher
+echo   Satvik bt-1 (SMC) - Startup Launcher
 echo ============================================
 echo.
 
@@ -18,15 +18,15 @@ if errorlevel 1 (
 )
 
 echo Starting dashboard server...
-start "SMC Dashboard Server" cmd /k "cd /d "%~dp0" && python server.py"
+start "Satvik bt-1 Dashboard" cmd /k "cd /d "%~dp0" && python server.py"
 
 echo Starting trading bot (v2.0 — enhanced)...
-start "SMC Trading Bot" cmd /k "cd /d "%~dp0" && python main.py"
+start "Satvik bt-1 Bot" cmd /k "cd /d "%~dp0" && python main.py"
 
 echo.
 echo Launched both processes in separate windows.
 echo - Dashboard: http://localhost:5000
-echo - Bot logs: see "SMC Trading Bot" window
+echo - Bot logs: see "Satvik bt-1 Bot" window
 echo.
 echo If the bot exits with MT5 authorization error, fix MT5 login/server in terminal.
 pause

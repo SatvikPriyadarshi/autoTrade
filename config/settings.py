@@ -1,5 +1,5 @@
 """
-Centralized Configuration for SMC AI Trading Bot
+Centralized Configuration for Satvik bt-1 (SMC)
 All settings in one place - loaded from environment variables with safe defaults.
 """
 
@@ -185,7 +185,7 @@ GMT = ZoneInfo("UTC")
 IST = ZoneInfo("Asia/Kolkata")
 
 BOT_MAGIC = 20250101
-BOT_COMMENT = "SMC_AI_BOT"
+BOT_COMMENT = "Satvik bt-1(smc)"
 
 RESOLVED_SYMBOL_TO_BASE: dict[str, str] = {}
 

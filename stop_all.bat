@@ -4,7 +4,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ============================================
-echo   SMC AI Trading Bot - Stop Launcher
+echo   Satvik bt-1 (SMC) - Stop Launcher
 echo ============================================
 echo.
 
@@ -17,8 +17,8 @@ powershell -NoProfile -Command ^
   "$procs = Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -and ( $_.CommandLine -match 'D:\\trading_bot\\bot.py' -or $_.CommandLine -match 'D:\\trading_bot\\server.py' ) }; foreach($p in $procs){ Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }"
 
 echo Closing launcher windows...
-taskkill /F /FI "WINDOWTITLE eq SMC Dashboard Server*" /IM cmd.exe >nul 2>&1
-taskkill /F /FI "WINDOWTITLE eq SMC Trading Bot*" /IM cmd.exe >nul 2>&1
+taskkill /F /FI "WINDOWTITLE eq Satvik bt-1 Dashboard*" /IM cmd.exe >nul 2>&1
+taskkill /F /FI "WINDOWTITLE eq Satvik bt-1 Bot*" /IM cmd.exe >nul 2>&1
 
 echo.
 echo Stop request sent.

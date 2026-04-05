@@ -15,6 +15,8 @@ from datetime import datetime, date, timedelta, timezone
 from collections import defaultdict
 from zoneinfo import ZoneInfo
 
+from config.settings import BOT_COMMENT, BOT_MAGIC
+
 app = Flask(__name__, static_folder="Dashboard")
 CORS(app)
 
@@ -23,7 +25,6 @@ HISTORY_DIR  = os.path.join(LOG_DIR, "history")
 TRADES_FILE  = os.path.join(LOG_DIR, "trades.csv")
 SIGNALS_FILE = os.path.join(LOG_DIR, "signals.csv")
 IST = ZoneInfo("Asia/Kolkata")
-BOT_MAGIC = 20250101
 
 
 # ──────────────────────────────────────────────
@@ -121,7 +122,12 @@ def get_mt5_account_snapshot() -> dict:
 def _is_bot_deal(deal) -> bool:
     magic = int(getattr(deal, "magic", 0) or 0)
     comment = str(getattr(deal, "comment", "") or "")
-    return magic == BOT_MAGIC or "SMC_AI_BOT" in comment or "SMC_" in comment
+    return (
+        magic == BOT_MAGIC
+        or BOT_COMMENT in comment
+        or "SMC_AI_BOT" in comment
+        or "SMC_" in comment
+    )
 
 
 def get_mt5_realized_daily_map(days_back: int = 120, only_bot: bool = True) -> dict:
@@ -433,7 +439,12 @@ def get_mt5_deals():
             ts_ist = ts_utc.astimezone(IST)
             magic = int(getattr(d, "magic", 0) or 0)
             comment = str(getattr(d, "comment", "") or "")
-            is_bot = magic == 20250101 or "SMC_AI_BOT" in comment
+            is_bot = (
+                magic == BOT_MAGIC
+                or BOT_COMMENT in comment
+                or "SMC_AI_BOT" in comment
+                or "SMC_" in comment
+            )
             if only_bot and not is_bot:
                 continue
             rows.append({
@@ -491,7 +502,12 @@ def get_mt5_positions():
         for p in positions:
             magic = int(getattr(p, "magic", 0) or 0)
             comment = str(getattr(p, "comment", "") or "")
-            is_bot = magic == 20250101 or "SMC_AI_BOT" in comment
+            is_bot = (
+                magic == BOT_MAGIC
+                or BOT_COMMENT in comment
+                or "SMC_AI_BOT" in comment
+                or "SMC_" in comment
+            )
             if only_bot and not is_bot:
                 continue
 
