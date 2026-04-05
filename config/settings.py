@@ -185,7 +185,7 @@ GMT = ZoneInfo("UTC")
 IST = ZoneInfo("Asia/Kolkata")
 
 BOT_MAGIC = 20250101
-BOT_COMMENT = "Satvik bt-1(smc)"
+BOT_COMMENT = "SVK_BT1_SMC"
 
 RESOLVED_SYMBOL_TO_BASE: dict[str, str] = {}
 
